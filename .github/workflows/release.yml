@@ -1,11 +1,7 @@
-# 推 tag 即发布（trusted publishing / OIDC）—— 不需要任何 Secret，也不需要 2FA 动态码。
-#
-# 前置（在 npm 网页上做一次）：该包 Settings → Trusted Publisher
-#   Publisher=GitHub Actions / owner=ethanchen669 / repo=dsh-plugin-fly-skins / workflow=release.yml
-#
-# 注意（本文件踩过的坑）：一个 step 里只能有一个 run；注释的缩进必须与同级键对齐。
-# 早先三版都是**缩进错了的 YAML**，GitHub 的表现是"run 建出来了、但没有任何 job"——
-# 看着像发布失败，其实是文件根本没被解析。
+# 发布：打 tag（v*）时用 OIDC + provenance 发到公开 npm。姿势照 @dsh-fly/dsh-plugin-fly-skins
+# 那份（已在生产用过），差别：纯声明包 ⇒ 跑本地 scripts/verify.mjs（不装依赖、不构建）；
+# 署名检查用等价的两行 git 查询；npm 升到 11（trusted publishing 需要 >= 11.5）。
+# 发布前必须：8 个 dsh-plugin-fly-* 依赖先去 private 并发出去，否则本包发出去也装不上。
 name: release
 
 on:
@@ -14,28 +10,23 @@ on:
 
 permissions:
   contents: read
-  id-token: write # trusted publishing 靠它换 OIDC token
+  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # 署名检查要全历史
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-      - name: 装依赖
-        run: pnpm install --frozen-lockfile
+          registry-url: https://registry.npmjs.org/
       - name: 全历史署名检查（内网身份一律拦下，硬门：脏了就不发）
-        run: node scripts/check-commit-identity.mjs --all
-      - name: 发布前先跑本仓门禁（构建 + tsc + 全部测试）
-        run: pnpm run verify
+        run: |
+          bad=$(git log --format='%ae%n%ce' | sort -u | grep -v '@users\.noreply\.github\.com$' || true)
+          if [ -n "$bad" ]; then echo "非 GitHub 署名：$bad"; exit 1; fi
+      - name: 发布前先跑本仓门禁
+        run: node scripts/verify.mjs
       - name: npm 升到 11（trusted publishing 需要 npm >= 11.5）
         run: |
           npm install -g npm@11

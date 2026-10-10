@@ -30,5 +30,8 @@
     "dsh-plugin-fly-blackbox": "0.1.0",
     "dsh-plugin-fly-smart": "0.1.0",
     "dsh-plugin-fly-guard": "0.1.0"
+  },
+  "scripts": {
+    "verify": "node scripts/verify.mjs"
   }
 }
