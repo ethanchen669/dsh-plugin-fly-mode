@@ -15,11 +15,22 @@
  * 那是"假红"而不是本包的缺陷。等它们发布后再加 `pnpm install --frozen-lockfile`。
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+/** 列出一个目录下的所有文件（相对路径）。 */
+function walkFiles(dir, prefix = '', found = []) {
+  if (!existsSync(dir)) return found
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+    if (entry.isDirectory()) walkFiles(join(dir, entry.name), rel, found)
+    else found.push(rel)
+  }
+  return found
+}
+
 const checks = []
 const check = (name, ok, detail = '') => {
   checks.push({ name, ok })
@@ -39,7 +50,26 @@ check('① 不含三个模型路由键（用户机器状态）', !/^\s*(brain|ha
 check('② 不含 registry 的 default 覆盖（默认归上游 standard）', !/^\s+default:/mu.test(patch))
 check('不带浏览器半边（dsh.client）', manifest.dsh?.client === undefined)
 check('不带 Fly 外壳（dsh-plugin-fly-shell）', !JSON.stringify(manifest.dependencies ?? {}).includes('fly-shell'))
-check('files 里有声明文件', (manifest.files ?? []).some(name => name.endsWith('cordis.patch.yml')))
+// 形状（用户 2026-10-11 裁决）：**7 个工具内联进包**（行表用本包子路径）+ **fly-smart 单独一个
+// plugin**（本包 dependencies 里唯一的一项，由 npm 装进 profile，行表保持裸名）。
+const INLINED = ['dsh-plugin-fly-binary', 'dsh-plugin-fly-reverse', 'dsh-plugin-fly-pwn', 'dsh-plugin-fly-diag', 'dsh-plugin-fly-recon', 'dsh-plugin-fly-blackbox', 'dsh-plugin-fly-guard']
+check('dependencies 只有 fly-smart 一个（其余 7 个已内联）', JSON.stringify(manifest.dependencies ?? {}) === JSON.stringify({ 'dsh-plugin-fly-smart': manifest.dependencies?.['dsh-plugin-fly-smart'] }), JSON.stringify(manifest.dependencies))
+for (const tool of INLINED) {
+  const entry = `tools/${tool}/index.js`
+  check(`内联：${entry} 在包里`, existsSync(join(ROOT, entry)))
+  check(`内联：行表用子路径引用 ${tool}`, patch.includes(`name: '@dsh-fly/dsh-plugin-fly-mode/${entry}'`))
+  check(`内联：${tool} 不再以裸名出现在行表`, !new RegExp(`^\\s*name:\\s*'?${tool}'?\\s*$`, 'mu').test(patch))
+}
+check('fly-smart 行保持裸名（单独一个 plugin）', /^\s*name:\s*'?dsh-plugin-fly-smart'?\s*$/mu.test(patch))
+check('files 里有声明文件与 tools/', (manifest.files ?? []).some(name => name.endsWith('cordis.patch.yml')) && (manifest.files ?? []).includes('tools'))
+// 内网 provider / 内网模型 id 不许进包（同 dsh-fly 主仓 shipping-hygiene 的两条红线）
+const INTERNAL = [/llm-mioffice/iu, /xiaomi\/mimo-/iu, /gpt-6-astra/iu, /ppio\/pa\//iu]
+const shippedText = [
+  patch,
+  ...INLINED.flatMap(tool => walkFiles(join(ROOT, 'tools', tool), `tools/${tool}`)).map(rel => readFileSync(join(ROOT, rel), 'utf8')),
+]
+const internalHits = shippedText.flatMap(text => String(text).split('\n').filter(line => INTERNAL.some(pattern => pattern.test(line))))
+check('交付字节里不出现内网 provider / 内网模型 id', internalHits.length === 0, internalHits.slice(0, 3).join(' | '))
 // 判据：URL 里必须出现**仓名**（= 包名去掉 scope 之后的那一段）。
 // 第一版写成 `name.replace('@dsh-fly/', 'dsh-plugin-fly-')` ⇒ 拼出
 // `dsh-plugin-fly-dsh-plugin-fly-mode`（包名里本来就有 `dsh-plugin-fly-`），于是这条断言

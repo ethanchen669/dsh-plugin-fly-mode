@@ -6,8 +6,11 @@
 
 ## 它是什么 / 不是什么
 
-- **是**：一条 `- insert:` 声明（`id: preset-fly`，行表来自 `presets/fly/agent.cordis.yml`）
-  \+ 8 个 Fly 工具包作为 `dependencies`（profile 用 hoisted 布局 ⇒ 行表里的裸包名解析得到）。
+- **是**：一条 `- insert:` 声明（`id: preset-fly`，行表来自 `presets/fly/agent.cordis.yml`）。其中
+  **7 个 Fly 工具**（binary / reverse / pwn / diag / recon / blackbox / guard）的源码**内联在包内
+  `tools/`**，行表用**本包子路径**引用它们 —— 装这个包**不会**在 npm 上再拉这 7 个包；
+  **`fly-smart` 单独一个 plugin**：它是本包 `dependencies` 里**唯一**一项，行表保持裸名，
+  由 npm 装进 profile 的 `node_modules`（它变化最快，且与工作台面板是一个整体，不适合内联）。
 - **不是**：不带 `dsh.client`（模式是 agent 平面，没有浏览器半边）；不带 Fly 工作台
   （console / diagnostics / netops / plugins / smart-panel 是各自独立的包）；**不带**
   `dsh-plugin-fly-shell`（那会在别人的 UI 上再画一层 Fly 外壳）。

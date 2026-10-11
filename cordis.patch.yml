@@ -1,6 +1,7 @@
 # 由仓库脚本生成，别手改：node scripts/build-fly-mode-bundle.mjs --out <本文件>
 # 同源：这段声明来自 scripts/lib/fly-profile.mjs 的 seedAgentPreset()（dev 装配写进 profile 的
-# 是同一条）。门禁用 --check 断言本文件 == 生成器输出。
+# 是同一条）；8 个工具的行名被改写成**本包的子路径**（tools/**，随包一起发布）。
+# 门禁用 --check 断言本文件与 tools/** 都 == 生成器输出。
 # 不含三模型路由（用户机器状态）、不写 registry default（默认归上游 standard）。
 - insert:
     - id: preset-fly
@@ -311,20 +312,15 @@
           # fly-recon registers BOTH a `tools/pre-execute` guard (deny unless
           # FLY_ALLOW_RECON=1) and its two tools from one apply(), so it is a single row.
           - id: tool-fly-binary
-            name: dsh-plugin-fly-binary
-
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-binary/index.js'
           - id: tool-fly-reverse
-            name: dsh-plugin-fly-reverse
-
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-reverse/index.js'
           - id: tool-fly-pwn
-            name: dsh-plugin-fly-pwn
-
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-pwn/index.js'
           - id: tool-fly-diag
-            name: dsh-plugin-fly-diag
-
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-diag/index.js'
           - id: tool-fly-recon
-            name: dsh-plugin-fly-recon
-
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-recon/index.js'
           # 客户端黑盒排查链（微信小程序实战沉淀）：`bx_proxy` / `bx_flows` / `bx_diff` /
           # `bx_doctor` / `bx_ca` / `bx_sysproxy` 六个工具 + 包内 `client-blackbox` skill 资产。
           # 行形状与上面几个 `tool-fly-*` 完全一致（`id` + `name`，**不**写 `inject`）：
@@ -336,8 +332,7 @@
           # "inject 恰好是这三项"与"preset 里有这一行"。
           # 起停代理 / 主动探测 / 改系统代理走 `FLY_ALLOW_INTERCEPT=1` 授权门；只读面永远可用。
           - id: tool-fly-blackbox
-            name: dsh-plugin-fly-blackbox
-
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-blackbox/index.js'
           # ── fly smart mode ───────────────────────────────────────────────────────────
 
           # Smart 模式（docs/smart-mode-design.md）：先设计、后执行、再验收的双模型工作流。
@@ -400,5 +395,5 @@
           # `scripts/lib/fly-profile.mjs` 的 `toolPackages` 是装配的唯一实现，门禁（含
           # `verify-fly-profile.mjs` 的"preset 挂上全部 N 行"）**从它派生**行名，凭喜好起名会让那条断言看不见这一行。
           - id: tool-fly-guard
-            name: dsh-plugin-fly-guard
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-guard/index.js'
 # <<< fly-agent-preset

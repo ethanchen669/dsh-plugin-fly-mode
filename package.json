@@ -1,8 +1,7 @@
 {
   "name": "@dsh-fly/dsh-plugin-fly-mode",
   "version": "0.1.0",
-  "description": "Fly 安全模式（agent preset `fly`）作为一个可安装的 bundle 层：装进任何 profile 后，那里就能服务 fly preset（治跨 profile 的 agent-preset/not-found）。",
-  "private": true,
+  "description": "Fly 安全模式（agent preset `fly`）作为一个可安装的包：自带 7 个 Fly 工具（源码内联在包内 tools/，行表用本包子路径引用），并依赖单独发布的 dsh-plugin-fly-smart；装进任何 profile 后那里就能服务 fly preset。",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -14,22 +13,13 @@
   },
   "files": [
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "tools"
   ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  },
-  "dependencies": {
-    "dsh-plugin-fly-binary": "0.1.0",
-    "dsh-plugin-fly-reverse": "0.1.0",
-    "dsh-plugin-fly-pwn": "0.1.0",
-    "dsh-plugin-fly-diag": "0.1.0",
-    "dsh-plugin-fly-recon": "0.1.0",
-    "dsh-plugin-fly-blackbox": "0.1.0",
-    "dsh-plugin-fly-smart": "0.1.0",
-    "dsh-plugin-fly-guard": "0.1.0"
   },
   "scripts": {
     "verify": "node scripts/verify.mjs"
@@ -37,5 +27,8 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"
+  },
+  "dependencies": {
+    "dsh-plugin-fly-smart": "0.1.0"
   }
 }

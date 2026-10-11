@@ -1,0 +1,26 @@
+{
+  "name": "dsh-plugin-fly-guard",
+  "version": "0.1.0",
+  "description": "DSH Fly 的持久化写授权门：官方 plugin_manager 的写入动作默认全拒，须 FLY_ALLOW_PROFILE_WRITE=1",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.spec.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ethanchen669/dsh-fly.git",
+    "directory": "packages/dsh-plugin-fly-guard"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  }
+}

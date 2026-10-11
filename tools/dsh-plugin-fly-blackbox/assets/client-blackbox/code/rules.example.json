@@ -1,0 +1,52 @@
+{
+  "_说明": [
+    "声明式排查规则。改完保存即生效，不需要重启 mitmdump（addon 按 mtime 热加载）。",
+    "纪律：永远先只开 watch 跑一遍，看清真实流量，再加 patch。",
+    "patch 一次只动一个字段，并在心里明确『观察点』是什么（界面显示？发包？响应码？）。",
+    "关掉注入必须显式写 enabled: false —— 空文件是非法配置，bx_proxy start 会拒绝启动。"
+  ],
+
+  "enabled": true,
+
+  "hosts": ["api.example.com"],
+
+  "watch": {
+    "paths": ["user|member|profile|account|enroll|apply|check"],
+    "log_bodies": true,
+    "log_all_requests": true,
+    "noise_hosts": ["weixin.qq.com", "qpic.cn", "gtimg.cn"]
+  },
+
+  "patch_response": [
+    {
+      "_场景": "服务端把『拦不拦』的决定权交给了客户端（state/confirm/Y/N）→ 客户端门禁，可解除",
+      "path": "member/checkMemberMe",
+      "mode": "force",
+      "set": { "state": true, "confirm": false }
+    },
+    {
+      "_场景": "诱出法：把空字段注入成非空，骗过前端必填校验，逼它把请求发出去",
+      "_技巧": "枚举字段优先试字符串 \"0\" —— JS 里它是真值，能同时过 !v 判假和 ==null 判空",
+      "path": "member/getMemberById",
+      "mode": "set_if_empty",
+      "set": { "gender": "0" }
+    },
+    {
+      "_场景": "给缺失字段补值（key 不存在时才新增）",
+      "path": "some/path",
+      "mode": "only_missing",
+      "create_missing": true,
+      "set": { "extraFlag": true }
+    }
+  ],
+
+  "patch_request": [
+    {
+      "_场景": "请求已经发出去了但字段是空的，直接在传输层补上",
+      "path": "member/updateMember",
+      "methods": ["POST"],
+      "mode": "set_if_empty",
+      "set": { "gender": "0" }
+    }
+  ]
+}

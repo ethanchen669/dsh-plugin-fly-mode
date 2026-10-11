@@ -1,0 +1,31 @@
+{
+  "name": "dsh-plugin-fly-blackbox",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "assets/client-blackbox/SKILL.md",
+    "assets/client-blackbox/reference/playbook.md",
+    "assets/client-blackbox/reference/checklist.md",
+    "assets/client-blackbox/reference/case-ttw.md",
+    "assets/client-blackbox/reference/rules.schema.md",
+    "assets/client-blackbox/code/mitm_addon_template.py",
+    "assets/client-blackbox/code/rules.example.json"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-shell": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-skill": "0.2.0-rc.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ethanchen669/dsh-fly.git",
+    "directory": "packages/dsh-plugin-fly-blackbox"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  }
+}
