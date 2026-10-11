@@ -1,7 +1,7 @@
 # 发布：打 tag（v*）时用 OIDC + provenance 发到公开 npm。姿势照 @dsh-fly/dsh-plugin-fly-skins
 # 那份（已在生产用过），差别：纯声明包 ⇒ 跑本地 scripts/verify.mjs（不装依赖、不构建）；
 # 署名检查用等价的两行 git 查询；npm 升到 11（trusted publishing 需要 >= 11.5）。
-# 发布前必须：8 个 dsh-plugin-fly-* 依赖先去 private 并发出去，否则本包发出去也装不上。
+# 发布前必须：唯一依赖 dsh-plugin-fly-smart 已在 npm 上（0.1.0 已发）；7 个工具已内联在包内。
 name: release
 
 on:
@@ -25,6 +25,11 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org/
+      - name: tag 与 package.json 版本必须一致（tag 指错提交 = 发错版本）
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          if [ "$want" != "$GITHUB_REF_NAME" ]; then echo "tag=$GITHUB_REF_NAME，但 package.json 里是 $want"; exit 1; fi
+          echo "tag 与版本一致：$GITHUB_REF_NAME"
       - name: 全历史署名检查（内网身份一律拦下，硬门：脏了就不发）
         run: |
           bad=$(git log --format='%ae%n%ce' | sort -u | grep -v '@users\.noreply\.github\.com$' || true)

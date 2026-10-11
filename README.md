@@ -32,21 +32,49 @@ node scripts/build-fly-mode-bundle.mjs --out ../dsh-plugins/dsh-plugin-fly-mode/
 （`pnpm setup:profile`）写进 `~/.dsh/profiles/fly/cordis.patch.yml` 的是**同一个函数**的输出。
 `--check` 用于门禁（漂移即红）。
 
-## 发布前要做的两件
+## 发布（0.1.3 起走 tag → OIDC，自动带 provenance）
 
-1. 8 个工具包目前都是 `private: true`（未发布）⇒ 先去掉它们的 `private` 并按同样方式发布，
-   否则本包的 `dependencies` 解析不到；本包自己的 `private: true` 也在那时拿掉。
-   **`private: true` 不是发布闸门**（实测：`npm publish --dry-run` 一路走到鉴权才停，鉴权前
-   没有任何拦截）—— 它只是"别误装"的占位。真正的闸门是 `publishConfig` 里钉死的
-   `registry: https://registry.npmjs.org/`：本机默认 registry 是**内网镜像**（`npm config get
-   registry` = `pkgs.d.xiaomi.net/…/mi-npm/`），不钉的话 `npm publish` 会发到内网镜像去。
-   手敲发布也请带 `--registry=https://registry.npmjs.org/`。
-2. `repository.url` 必须与跑发布 workflow 的仓库一致（npm `--provenance` 会校验；写错的失败
-   形状是"直接拒发"，见 `dsh-fly/AGENTS.md` 坑表）。
+- **以后每次发版**：升 `version` → 提交 → 打**注释 tag** → 推 tag；`.github/workflows/release.yml`
+  会自动 `npm publish --access public --provenance` —— **不需要 token、不需要 2FA、不需要人工批准**。
+  前提是包的「Settings → Trusted Publisher」按下面配好（**一次即可**）：
+
+  ```
+  Publisher            GitHub Actions
+  Organization or user ethanchen669
+  Repository           dsh-plugin-fly-mode
+  Workflow filename    release.yml        ← 只写文件名，不是 workflow 里的 name:
+  Allowed actions      ☑ Allow npm publish  ← 不勾只会"暂存"，npm publish 会"成功"但什么都不发
+  ```
+
+  重推同一个 tag **不会**重跑 workflow ⇒ 要重跑就换一个新 tag。
+- **首次发布（≤0.1.2）走的是另一条路**：包在 npm 上还不存在 ⇒ 没有 Trusted Publisher 页面可填，
+  只能 `npm stage publish --access public` 再在网页上批准（`stage` 不需要 2FA）。
+  0.1.0 / 0.1.1 已废弃，**0.1.2 是最后一个用 stage 发出去的版本**。
+- **验收三件**（必须**换缓存键**再读：registry 的 packument 会被 CDN 缓存，反复查同一把钥匙只会读到第一次的结果）：
+  ① `dist-tags.latest == 新版本`；② **`dist.attestations` 存在**（= provenance 成了）；
+  ③ `readme` 是**发布那一刻**的快照（改了 README 要等下一次发版才上 npm 页面）。
+- 发布前两条硬要求：`repository.url` 与跑 workflow 的仓库**逐字一致**（`--provenance` 会校验，写错**直接拒发**）；
+  发布目标钉在 `publishConfig.registry = https://registry.npmjs.org/` —— 本机默认 registry 是**内网镜像**。
+
+## 安装
+
+```bash
+# CLI 路径（web 等 profile）；cwd 必须是 DSH_HOME
+cd ~/.dsh
+dsh plugin --profile=web add @dsh-fly/dsh-plugin-fly-mode@0.1.3 --registry=https://registry.npmjs.org/
+```
+
+- 装完**必须重启那个进程**：引擎把层与服务缓存在**进程内**，刷新页面不够。
+- **官方桌面版**归 app 独占（`dsh plugin` 会拒：`profile "desktop" is managed exclusively by the
+  Electron application`）⇒ 在 `~/.dsh/profiles/desktop/` 里 `pnpm add …@0.1.3 --registry=…`，
+  并且要把包名加进 `package.json` 的 **`dsh.profile.bundles`** —— 那一条才让它成为一层
+  （只写 `dependencies` 是不会生效的）。
 
 ## 仓库状态（2026-10-11）
 
-- 本仓刚落地：`cordis.patch.yml`（生成）、`package.json`、本 README。
-- `.github/workflows/{ci,release}.yml` 是从 `@dsh-fly/dsh-plugin-fly-skins` 仓**抄来的模板，
-  尚未适配**（里面的包名/路径/构建步骤还是皮肤那套）—— 适配是发布前的一步，别直接推它去跑。
+- 形状定稿：一条 `- insert:` 声明 + 包内 `tools/`（7 个工具内联，行表用本包子路径引用）+
+  `dsh-plugin-fly-smart` 作为**唯一** npm 依赖。声明由 `dsh-fly` 仓的
+  `scripts/build-fly-mode-bundle.mjs` 生成，门禁用 `--check` 断漂移（含多出来的文件）。
+- `.github/workflows/{ci,release}.yml` **已适配本仓**（纯声明包：不装依赖、直接跑
+  `node scripts/verify.mjs`），CI 已在公开仓实测全绿，含 `fetch-depth: 0` 的**全历史署名硬门**。
 - 身份已按规范设好（仓级 `user.email = ethanchen669@users.noreply.github.com`）。
