@@ -17,6 +17,10 @@ jobs:
         node: [22, 24]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 默认 depth=1 ⇒ "全历史署名检查"只看得到一笔 —— 那是把尺子遮住了
+          # （皮肤仓原件同样写死 fetch-depth: 0，注释一模一样）
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}

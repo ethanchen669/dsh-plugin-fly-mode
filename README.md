@@ -33,6 +33,11 @@ node scripts/build-fly-mode-bundle.mjs --out ../dsh-plugins/dsh-plugin-fly-mode/
 
 1. 8 个工具包目前都是 `private: true`（未发布）⇒ 先去掉它们的 `private` 并按同样方式发布，
    否则本包的 `dependencies` 解析不到；本包自己的 `private: true` 也在那时拿掉。
+   **`private: true` 不是发布闸门**（实测：`npm publish --dry-run` 一路走到鉴权才停，鉴权前
+   没有任何拦截）—— 它只是"别误装"的占位。真正的闸门是 `publishConfig` 里钉死的
+   `registry: https://registry.npmjs.org/`：本机默认 registry 是**内网镜像**（`npm config get
+   registry` = `pkgs.d.xiaomi.net/…/mi-npm/`），不钉的话 `npm publish` 会发到内网镜像去。
+   手敲发布也请带 `--registry=https://registry.npmjs.org/`。
 2. `repository.url` 必须与跑发布 workflow 的仓库一致（npm `--provenance` 会校验；写错的失败
    形状是"直接拒发"，见 `dsh-fly/AGENTS.md` 坑表）。
 
