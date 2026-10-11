@@ -69,6 +69,11 @@ const shippedText = [
   ...INLINED.flatMap(tool => walkFiles(join(ROOT, 'tools', tool), `tools/${tool}`)).map(rel => readFileSync(join(ROOT, rel), 'utf8')),
 ]
 const internalHits = shippedText.flatMap(text => String(text).split('\n').filter(line => INTERNAL.some(pattern => pattern.test(line))))
+// 本地垃圾（python 缓存、编辑器临时文件）不许进包：它们会随 `files: ['tools']` 一起被 npm 打包。
+// 2026-10-11 实测撞到过：源包目录里有一份未被 git 跟踪的 `__pycache__/*.pyc`，被生成器整目录拷进包里。
+const JUNK = /(^|\/)(__pycache__|\.DS_Store)($|\/)|(\.pyc|\.swp|\.orig)$/u
+const junkHits = walkFiles(join(ROOT, 'tools'), 'tools').filter(rel => JUNK.test(rel))
+check('交付字节里没有本地垃圾（__pycache__/.pyc/.DS_Store/…）', junkHits.length === 0, junkHits.slice(0, 3).join(' | '))
 check('交付字节里不出现内网 provider / 内网模型 id', internalHits.length === 0, internalHits.slice(0, 3).join(' | '))
 // 判据：URL 里必须出现**仓名**（= 包名去掉 scope 之后的那一段）。
 // 第一版写成 `name.replace('@dsh-fly/', 'dsh-plugin-fly-')` ⇒ 拼出
