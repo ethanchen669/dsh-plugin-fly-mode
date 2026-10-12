@@ -346,8 +346,10 @@
           # `inject = ['tools', 'commands', 'systemPrompt']` —— 少一个都会在 apply 里抛，
           # 而抛 = 整棵 preset 挂载被拒（S6 根因，§12.6）。两个模型路由
           # （brainRoute/handRoute）留给设置行配置。
+          # 2026-10-12 角色对调：裸名 `dsh-plugin-fly-smart` 现在是**宿主平面的面板**（客户端半边
+          # 只对裸名行登记），agent 平面的工具在这一行的子路径上。
           - id: tool-fly-smart
-            name: dsh-plugin-fly-smart
+            name: dsh-plugin-fly-smart/tools/index.js
             config:
               enabled: true
               # 返工额度是**每阶段**的：一个阶段反复迭代不该把后面阶段的预算吃掉。额度耗尽不是强制
@@ -576,7 +578,7 @@
             name: '@deepseek-ai/dsh-plugin-manager/tools'
             disabled: true
           - id: tool-fly-smart
-            name: dsh-plugin-fly-smart
+            name: dsh-plugin-fly-smart/tools/index.js
             config:
               enabled: true
               maxRework: 5

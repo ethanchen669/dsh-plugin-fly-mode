@@ -82,7 +82,14 @@ for (const tool of INLINED) {
   check(`内联：行表用子路径引用 ${tool}`, patch.includes(`name: '@dsh-fly/dsh-plugin-fly-mode/${entry}'`))
   check(`内联：${tool} 不再以裸名出现在行表`, !new RegExp(`^\\s*name:\\s*'?${tool}'?\\s*$`, 'mu').test(patch))
 }
-check('fly-smart 行保持裸名（单独一个 plugin）', /^\s*name:\s*'?dsh-plugin-fly-smart'?\s*$/mu.test(patch))
+// 2026-10-12 角色对调：smart 的**裸名**是宿主平面的面板（客户端半边只对裸名行登记），
+// 工具行必须指向 `tools/index.js` 子路径 —— 裸名行进会话平面会把面板挂到每个会话上。
+// 引号可选：生成器写的是 `name: '<spec>'`，而 preset 源里那一行**不带引号** —— 判据写死引号
+// 会明明在却判没有（这一晚第四次踩，见 dsh-fly 的同一个坑）。
+const SMART_TOOL_ROW = 'dsh-plugin-fly-smart/tools/index.js'
+check('fly-smart 的工具行指向 tools 子路径',
+  patch.includes(`name: '${SMART_TOOL_ROW}'`) || patch.includes(`name: ${SMART_TOOL_ROW}`))
+check('fly-smart 的裸名行**不**出现在行表里', !/^\s*name:\s*'?dsh-plugin-fly-smart'?\s*$/mu.test(patch))
 // 第二个 preset：**Fly 标准模式**（上游 standard 的行表 + smart，**不含**安全工具行）。
 check('preset-fly-standard 在包里', /^\s*- id: preset-fly-standard\s*$/mu.test(patch))
 check('preset-fly-standard 的 config.id 是 fly-standard', /^\s*id: fly-standard\s*$/mu.test(patch))
