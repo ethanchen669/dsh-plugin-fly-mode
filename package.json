@@ -1,7 +1,7 @@
 {
   "name": "@dsh-fly/dsh-plugin-fly-mode",
-  "version": "0.1.3",
-  "description": "Fly 安全模式（agent preset `fly`）作为一个可安装的包：自带 7 个 Fly 工具（源码内联在包内 tools/，行表用本包子路径引用），并依赖单独发布的 dsh-plugin-fly-smart；装进任何 profile 后那里就能服务 fly preset。",
+  "version": "0.1.4",
+  "description": "Fly 模式作为一个可安装的包：**两个 preset** —— Fly 安全模式（preset-fly，7 个安全工具内联 + smart）与 Fly 标准模式（preset-fly-standard，上游 standard 的行表 + smart，无安全工具）；依赖单独发布的 dsh-plugin-fly-smart。",
   "type": "module",
   "license": "MIT",
   "repository": {

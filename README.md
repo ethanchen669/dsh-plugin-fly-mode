@@ -6,7 +6,11 @@
 
 ## 它是什么 / 不是什么
 
-- **是**：一条 `- insert:` 声明（`id: preset-fly`，行表来自 `presets/fly/agent.cordis.yml`）。其中
+- **是**：**两个 preset** 的声明（`- insert:`）：
+  - **Fly 安全模式** `preset-fly`（行表来自 `dsh-fly` 的 `presets/fly/agent.cordis.yml`，41 行）；
+  - **Fly 标准模式** `preset-fly-standard`（行表 = **上游 `standard` 的行表** + 一行 smart，33 行）——
+    由生成器从**引擎自己的组合结果**里取上游行表（不手抄），所以引擎升级后行表跟着走、漂了 `--check` 会红。
+  其中
   **7 个 Fly 工具**（binary / reverse / pwn / diag / recon / blackbox / guard）的源码**内联在包内
   `tools/`**，行表用**本包子路径**引用它们 —— 装这个包**不会**在 npm 上再拉这 7 个包；
   **`fly-smart` 单独一个 plugin**：它是本包 `dependencies` 里**唯一**一项，行表保持裸名，
@@ -14,7 +18,7 @@
 - **不是**：不带 `dsh.client`（模式是 agent 平面，没有浏览器半边）；不带 Fly 工作台
   （console / diagnostics / netops / plugins / smart-panel 是各自独立的包）；**不带**
   `dsh-plugin-fly-shell`（那会在别人的 UI 上再画一层 Fly 外壳）。
-- **不写 registry 的 `default:`**：默认模式归上游 `standard`。装上它 ≠ 默认变 fly —— fly
+- **不写 registry 的 `default:`**：默认模式归上游 `standard`。装上它 ≠ 默认变 fly（或 fly-standard）——
   只是「设置 → Agent 预设」里多出来的一个可选模式。
 - **不含三模型路由**：`brainRoute` / `handRoute` / `reviewRoute` 是**用户机器**上的状态
   （`~/.dsh-fly/smart-routes.json`，面板写），本机那份值还是内网 provider。未被配置时工具会

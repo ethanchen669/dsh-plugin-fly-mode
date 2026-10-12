@@ -45,7 +45,29 @@ check('包里声明文件在（dsh.bundle.patch 指得对）', patch.length > 0,
 check('声明是 `- insert:` 形式', /^- insert:$/mu.test(patch))
 check('声明 id 是 preset-fly', /^ {4}- id: preset-fly$/mu.test(patch))
 check('引擎认的声明行名在多', /^\s+name: '@deepseek-ai\/dsh-agent-preset'$/mu.test(patch))
-check('行表齐（41 行 + 声明自身）', patch.split('\n').filter(line => /^\s+- id: /u.test(line)).length === 42)
+/**
+ * 数某条 preset 的行表（**含条目自身那一行**，与既有 41 行的口径一致）。
+ *
+ * 边界：条目行之后，遇到下一个**缩进不更深且以 `- ` 开头**的行就算结束（同级条目）。
+ * 第一版把边界写成三个条件与或，读成 34/32 这种飘忽的数 —— 尺子本身要能一句话说清。
+ */
+function presetRowsOf(entryId) {
+  const lines = patch.split('\n')
+  const start = lines.findIndex(line => new RegExp(`^\\s*- id: ${entryId}\\s*$`, 'u').test(line))
+  if (start === -1) return null
+  const indent = lines[start].match(/^\s*/u)[0].length
+  const block = [lines[start]]
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (line.trim() !== '' && line.match(/^\s*/u)[0].length <= indent && line.trimStart().startsWith('- ')) break
+    block.push(line)
+  }
+  return block
+}
+const flyBlock = presetRowsOf('preset-fly')
+const standardBlock = presetRowsOf('preset-fly-standard')
+check('安全模式行表齐（41 行 + 声明自身）', flyBlock !== null && flyBlock.filter(line => /^\s+- id: /u.test(line)).length === 42)
+check('标准模式行表齐（33 行 + 声明自身）', standardBlock !== null && standardBlock.filter(line => /^\s+- id: /u.test(line)).length === 34)
 check('① 不含三个模型路由键（用户机器状态）', !/^\s*(brain|hand|review)Route\s*:/mu.test(patch))
 check('② 不含 registry 的 default 覆盖（默认归上游 standard）', !/^\s+default:/mu.test(patch))
 check('不带浏览器半边（dsh.client）', manifest.dsh?.client === undefined)
@@ -61,6 +83,17 @@ for (const tool of INLINED) {
   check(`内联：${tool} 不再以裸名出现在行表`, !new RegExp(`^\\s*name:\\s*'?${tool}'?\\s*$`, 'mu').test(patch))
 }
 check('fly-smart 行保持裸名（单独一个 plugin）', /^\s*name:\s*'?dsh-plugin-fly-smart'?\s*$/mu.test(patch))
+// 第二个 preset：**Fly 标准模式**（上游 standard 的行表 + smart，**不含**安全工具行）。
+check('preset-fly-standard 在包里', /^\s*- id: preset-fly-standard\s*$/mu.test(patch))
+check('preset-fly-standard 的 config.id 是 fly-standard', /^\s*id: fly-standard\s*$/mu.test(patch))
+{
+  const smartRows = standardBlock.filter(line => /^\s+- id: tool-fly-smart$/u.test(line))
+  const securityRows = standardBlock.filter(line => line.includes('tools/dsh-plugin-fly-'))
+  const totalRows = patch.split('\n').filter(line => /^\s+- id: /u.test(line)).length
+  check('标准模式恰好一行 smart', smartRows.length === 1)
+  check('标准模式**不含**任何安全工具行', securityRows.length === 0, securityRows.slice(0, 2).join(' | '))
+  check('整份 patch 的行数 == 两个 preset 之和（42 + 34）', totalRows === 76, String(totalRows))
+}
 check('files 里有声明文件与 tools/', (manifest.files ?? []).some(name => name.endsWith('cordis.patch.yml')) && (manifest.files ?? []).includes('tools'))
 // 内网 provider / 内网模型 id 不许进包（同 dsh-fly 主仓 shipping-hygiene 的两条红线）
 const INTERNAL = [/llm-mioffice/iu, /xiaomi\/mimo-/iu, /gpt-6-astra/iu, /ppio\/pa\//iu]
