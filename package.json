@@ -29,6 +29,6 @@
     "access": "public"
   },
   "dependencies": {
-    "dsh-plugin-fly-smart": "^0.1.0"
+    "dsh-plugin-fly-smart": "^0.1.2"
   }
 }
