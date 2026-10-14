@@ -454,8 +454,21 @@ export function apply(ctx) {
     parameters: {},
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(_args, exec) {
+      // 证据形状（规划 §5.1）：信封 JSON —— 原有读数整体进 observed，另加 confidence / limitations。
+      // 这个工具量的是**当前链路快照**（活的），所以 limitations 必须说清"这是一次采样、不是历史"。
       exec.signal.throwIfAborted()
-      return JSON.stringify(await collectLink(shell, exec.signal), null, 2)
+      const snapshot = await collectLink(shell, exec.signal)
+      return JSON.stringify({
+        tool: 'diag_wifi_link',
+        target: 'the Wi-Fi interface of this host',
+        operation: 'read one passive snapshot of the local Wi-Fi link (no probe requests, no packets)',
+        observed: snapshot,
+        confidence: 'observed',
+        limitations: [
+          '一次采样：只说"这一刻"的取值，不说明它稳不稳（要历史用 diag_net_watch 记）',
+          '被动读系统报告：不主动发探测、不连接任何东西，因此看不到对端或邻居的行为',
+        ],
+      }, null, 2)
     },
   }))
 

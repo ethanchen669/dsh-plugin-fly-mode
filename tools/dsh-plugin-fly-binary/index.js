@@ -514,16 +514,30 @@ export function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute(args, exec) {
+      // 证据形状（规划 §5.1 的第一个试点）：返回值是**信封 JSON**，不再是裸表格文本。
+      // 真值判据不变（observed.dump 里是 objdump 原文），新增 confidence 与 limitations ——
+      // 逼这个工具回答"这个结论看不见什么"（本仓最贵的那条教训）。
       const run = await runCmd(shell, ['objdump', '-h', args.path], exec)
-      if (run.exitCode === 0 && run.stdout.trim() !== '') return run.stdout
+      const ok = run.exitCode === 0 && run.stdout.trim() !== ''
       // GNU binutils is not part of macOS. Instead of an opaque "command not found",
       // say which method failed and what to use instead (same shape as bin_readelf).
-      const kind = await runCmd(shell, ['file', '-b', args.path], exec)
-      return [
-        `objdump -h is unavailable or failed on this host (exit ${run.exitCode}), so section headers could not be read with it`,
-        `file(1) says: ${kind.stdout.trim() || '(nothing)'}`,
-        'GNU binutils does not ship with macOS; for Mach-O use rev_imports (nm -u) or rev_disasm (objdump -d)',
-      ].join('\n')
+      const kind = ok ? null : await runCmd(shell, ['file', '-b', args.path], exec)
+      return JSON.stringify({
+        tool: 'bin_sections',
+        target: args.path,
+        operation: 'read ELF section headers (table only: no flags, no relocations, no disassembly)',
+        observed: {
+          dump: ok ? run.stdout : '',
+          method: ok ? 'objdump -h' : null,
+          format: ok ? null : ((kind.stdout || '').trim() || null),
+          exitCode: run.exitCode,
+        },
+        confidence: 'observed',
+        limitations: ok
+          ? ['读的是 objdump -h 的表格原文，未解析节标志 / 重定位 / 节内容']
+          : [`objdump -h 不在本机或读不了这个文件（exit ${run.exitCode}），observed.dump 因此为空 —— 节表没有被读到`,
+             'macOS 不带 GNU binutils；Mach-O 用 rev_imports (nm -u) 或 rev_disasm (objdump -d)'],
+      }, null, 2)
     },
   }))
 }

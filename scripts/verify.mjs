@@ -66,7 +66,7 @@ function presetRowsOf(entryId) {
 }
 const flyBlock = presetRowsOf('preset-fly')
 const standardBlock = presetRowsOf('preset-fly-standard')
-check('安全模式行表齐（43 行 + 声明自身）', flyBlock !== null && flyBlock.filter(line => /^\s+- id: /u.test(line)).length === 44)
+check('安全模式行表齐（42 行 + 声明自身）', flyBlock !== null && flyBlock.filter(line => /^\s+- id: /u.test(line)).length === 43)
 check('标准模式行表齐（33 行 + 声明自身）', standardBlock !== null && standardBlock.filter(line => /^\s+- id: /u.test(line)).length === 34)
 check('① 不含三个模型路由键（用户机器状态）', !/^\s*(brain|hand|review)Route\s*:/mu.test(patch))
 check('② 不含 registry 的 default 覆盖（默认归上游 standard）', !/^\s+default:/mu.test(patch))
@@ -99,7 +99,7 @@ check('preset-fly-standard 的 config.id 是 fly-standard', /^\s*id: fly-standar
   const totalRows = patch.split('\n').filter(line => /^\s+- id: /u.test(line)).length
   check('标准模式恰好一行 smart', smartRows.length === 1)
   check('标准模式**不含**任何安全工具行', securityRows.length === 0, securityRows.slice(0, 2).join(' | '))
-  check('整份 patch 的行数 == 两个 preset 之和（43 + 35）', totalRows === 78, String(totalRows))
+  check('整份 patch 的行数 == 两个 preset 之和（43 + 34）', totalRows === 77, String(totalRows))
 }
 check('files 里有声明文件与 tools/', (manifest.files ?? []).some(name => name.endsWith('cordis.patch.yml')) && (manifest.files ?? []).includes('tools'))
 // 内网 provider / 内网模型 id 不许进包（同 dsh-fly 主仓 shipping-hygiene 的两条红线）

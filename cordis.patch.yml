@@ -159,10 +159,7 @@
             group: true
             isolate:
               planMode: true
-              # 评审姿态自己的服务（ReviewModeController 用 super(ctx,'reviewMode') **提供**服务 ⇒
               # 必须坐在带 isolate realm 的 group 里；否则它往 root realm 发布，挂载即被拒 —— 实测报错原文：
-              # "Preset services require isolate realms: reviewMode"）。
-              reviewMode: true
             config:
               - id: plan-mode
                 name: '@deepseek-ai/dsh-plan-mode'
@@ -187,8 +184,6 @@
               # 行保持**裸名**（内联形状的契约）：生成器认这个裸名，再把它改写成模式包内的
               # `dsh-plugin-fly-mode/tools/dsh-plugin-fly-review/index.js`（同那 8 个内联工具行）；
               # 包内的源码布局则是 `tools/index.js`（内联器照这个路径拷贝）。
-              - id: tool-fly-review
-                name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-review/index.js'
           # ── compaction ──────────────────────────────────────────────────────────────
 
           # `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner must
