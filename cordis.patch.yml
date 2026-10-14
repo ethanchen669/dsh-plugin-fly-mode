@@ -177,12 +177,10 @@
 
                         When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
 
-              # 评审姿态（docs/fly-review-mode-plan.md）：`/review` 开关一段只读引导（先讲阻塞问题、
               # 每条结论带 path:line 证据），收口工具 `exit_review_mode` 把判词交用户裁决。
               # 形状与上面的 plan-mode 同族：姿态的效果就是一段引导 ⇒ 进/出只改提示词段、不改工具目录；
               # 状态记会话日志 ⇒ resume / fork 不丢。**只读是引导、不是强制**（沙箱与审批策略独立执行）。
               # 行保持**裸名**（内联形状的契约）：生成器认这个裸名，再把它改写成模式包内的
-              # `dsh-plugin-fly-mode/tools/dsh-plugin-fly-review/index.js`（同那 8 个内联工具行）；
               # 包内的源码布局则是 `tools/index.js`（内联器照这个路径拷贝）。
           # ── compaction ──────────────────────────────────────────────────────────────
 

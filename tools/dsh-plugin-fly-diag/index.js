@@ -480,9 +480,21 @@ export function apply(ctx) {
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(args, exec) {
+      // 证据形状（规划 §5.1）：信封 JSON。这个工具读的是**扫描缓存**（活数据），
+      // limitations 必须说清"缓存要几轮才收敛、一轮会漏报"这件事 —— 否则容易把漏读当没有。
       exec.signal.throwIfAborted()
       const snapshot = await collectChannels(shell, { rounds: clampInteger(args.rounds, 3, 1, 8), signal: exec.signal })
-      return JSON.stringify(snapshot, null, 2)
+      return JSON.stringify({
+        tool: 'diag_wifi_channels',
+        target: 'the 5GHz channel occupancy seen from this host',
+        operation: 'read the system scan cache and fold neighbours into 80MHz-block availability',
+        observed: snapshot,
+        confidence: 'observed',
+        limitations: [
+          '读的是系统扫描缓存：缓存要几轮才收敛，一轮会漏报（本包默认读 3 轮）',
+          '只读缓存，不发探测请求、不连接任何东西 —— 因此看不到两次采样之间的变化',
+        ],
+      }, null, 2)
     },
   }))
 
