@@ -430,7 +430,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'diag_net',
-    description: 'Snapshot listening sockets (lsof/netstat best-effort).',
+    description: 'Snapshot listening sockets.',
     parameters: {},
     output: {
       schema: { type: 'string' },

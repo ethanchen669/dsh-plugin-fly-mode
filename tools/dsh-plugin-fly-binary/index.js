@@ -470,7 +470,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'bin_readelf',
-    description: 'Dump ELF headers / program headers / dynamic section (readelf when installed, else parsed natively).',
+    description: 'Dump ELF headers / program headers / dynamic section.',
     parameters: {
       path: { type: 'string', required: true },
       mode: { type: 'string', description: 'headers | segments | dynamic' },
@@ -505,7 +505,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'bin_sections',
-    description: 'List ELF section headers (objdump -h).',
+    description: 'List ELF section headers.',
     parameters: {
       path: { type: 'string', required: true },
     },
@@ -514,7 +514,16 @@ export function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute(args, exec) {
-      return requireOk(await runCmd(shell, ['objdump', '-h', args.path], exec), 'objdump -h')
+      const run = await runCmd(shell, ['objdump', '-h', args.path], exec)
+      if (run.exitCode === 0 && run.stdout.trim() !== '') return run.stdout
+      // GNU binutils is not part of macOS. Instead of an opaque "command not found",
+      // say which method failed and what to use instead (same shape as bin_readelf).
+      const kind = await runCmd(shell, ['file', '-b', args.path], exec)
+      return [
+        `objdump -h is unavailable or failed on this host (exit ${run.exitCode}), so section headers could not be read with it`,
+        `file(1) says: ${kind.stdout.trim() || '(nothing)'}`,
+        'GNU binutils does not ship with macOS; for Mach-O use rev_imports (nm -u) or rev_disasm (objdump -d)',
+      ].join('\n')
     },
   }))
 }

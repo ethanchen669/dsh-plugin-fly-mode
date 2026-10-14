@@ -94,7 +94,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'rev_imports',
-    description: 'List imported (undefined) symbols: objdump -T for ELF, nm -u for Mach-O and stripped files.',
+    description: 'List imported (undefined) symbols.',
     parameters: {
       path: { type: 'string', required: true },
     },
@@ -155,7 +155,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'rev_gadget_scan',
-    description: 'Scan for simple ROP gadgets with ROPgadget if installed, else a built-in objdump scanner.',
+    description: 'Scan for simple ROP gadgets.',
     parameters: {
       path: { type: 'string', required: true },
       filter: { type: 'string', description: 'Optional gadget filter, e.g. "pop rdi"' },

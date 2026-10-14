@@ -7,7 +7,7 @@
  *  · **知识层**：一个 bundled skill（`assets/client-blackbox/`），按需加载。agent 读到的是
  *    心智模型（三源一闸 S1/S2/S3/G）、六条判据 T1–T6、五阶段带 Gate 流程与可复用脚本模板。
  *    知识本身不产生副作用，所以不受授权闸门管。
- *  · **执行层**：六个工具，走宿主 `shell` 接缝。它只管**可观测性与判定**（起代理、判管道、
+ *  · **执行层**：七个工具，走宿主 `shell` 接缝。它只管**可观测性与判定**（起代理、判管道、
  *    读抓包、比对前后），改写路径（请求/响应注入）必须显式授权。
  *
  * 三条纪律写死在实现里，因为每一条都对应一次实测事故：
@@ -37,6 +37,8 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+// gzip 只用 Node 自带的 `zlib`：`.har.gz` 的识别**按 magic 判**，不新增依赖、也不靠扩展名。
+import { gunzipSync } from 'node:zlib'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { BUNDLED_SKILL_RANK } from '@deepseek-ai/dsh-skill'
 
@@ -443,6 +445,25 @@ async function statSizeVia(shell, exec, path, what) {
   return Number(last)
 }
 
+/**
+ * 读一份 HAR（`bx_har` 的入口）：**先 stat 再走接缝读**，与 `bx_flows` 同一条路、同一个量级上限。
+ *
+ * 顺序不能反：先 stat 才能在读之前就拒掉"重到解不动"的文件（真的读进来才发现超限，那一次
+ * base64 已经付过了）；而读本身必须经 `readTextFileVia`，否则沙箱拒绝会变成一个裸 EACCES，
+ * 而不是 §B4 里那条 `SandboxError`。
+ */
+async function readHarFile(shell, exec, path, what) {
+  const size = await statSizeVia(shell, exec, path, what)
+  if (size > HAR_MAX_BYTES) {
+    throw new Error(
+      `${what} 有 ${(size / 1024 / 1024).toFixed(1)}MB，超过 ${HAR_MAX_BYTES / 1024 / 1024}MB 上限，拒绝读（读它要走 base64，重了解不动）。\n`
+      + '修法：导出时只勾目标域名（DevTools 的 filter / mitmproxy 过滤后再存），'
+      + '或先用 bx_flows grep 定位目标域名，只抓那一段。',
+    )
+  }
+  return readHarDocument(await readTextFileVia(shell, exec, path, what), path)
+}
+
 /** 状态文件在**工作区内**（唯一允许的自身状态写入面）。 */
 function statePath(root) {
   return join(root, '.fly-blackbox', 'proxy.json')
@@ -798,6 +819,329 @@ export function diffJson(a, b, path = '') {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// §B7 `bx_har`：HAR 的归一化、摘要与两次捕获对比
+//
+// 两条纪律，各对应一类事故：
+//
+//  1. **白名单式脱敏**（不是"输出前擦一遍"）：归一化只**挑**要用的字段，headers / cookies /
+//     postData / content 从源头就不复制。HAR 里最常出现的凭据正好在这些地方（`Cookie` /
+//     `Authorization` / `Set-Cookie` / 请求体里的令牌），而擦除式脱敏只要漏一个字段，就是
+//     一整份令牌落进模型上下文。URL 的 query 与 fragment 同理：**不入键、不输出**。
+//  2. **截断显式**：任何受 `top` 限界的列表都给 `bounds`（shown / total / omitted），顶层另有
+//     `truncated` 布尔 —— 省略绝不藏起来（把"只列了 20 条"读成"一共 20 条"会直接得出错误
+//     的量级结论，这正是 `bx_flows` 那条 truncated 纪律的同族）。
+//
+// 数字口径（同时写进结果的 `limitations`）：`bytes` = `response.content.size`（缺失时
+// `response.bodySize`；都没有则 `null`，绝不用 0 假装知道）；`timeMs` = `entry.time`。
+// 文件读取走 §B4 的接缝（`base64 -i`，与 `bx_flows` / `bx_diff` 同一条路）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `top` 缺省；任何列表超过它就一定在 `bounds.<list>.omitted` 里报出来。 */
+const HAR_DEFAULT_TOP = 20
+const HAR_GROUPINGS = ['host', 'status', 'mime']
+/** 与 `bx_flows` 同一个量级上限：读文件要走 base64（4/3 膨胀），再大就不是"读一份摘要"的重量了。 */
+const HAR_MAX_BYTES = 32 * 1024 * 1024
+/** 对比用的**大小档位**边界：打点/时间戳会让字节数永远不相等，档位才是"变了没有"的判据。 */
+const HAR_SIZE_BUCKETS = [[1024, '<1KB'], [10 * 1024, '1-10KB'], [100 * 1024, '10-100KB'], [1024 * 1024, '100KB-1MB']]
+const HAR_SIZE_BUCKET_TEXT = '0-1KB / 1-10KB / 10-100KB / 100KB-1MB / >=1MB'
+
+/** 字节 → 档位。`null`/负数/非数 → `unknown`（缺数据不等于"小"）。 */
+export function harSizeBucket(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return 'unknown'
+  for (const [bound, label] of HAR_SIZE_BUCKETS) if (bytes < bound) return label
+  return '>=1MB'
+}
+
+/** HAR 的 `request.url` → `{ host, path }`（**query 与 fragment 一律丢掉**：它们常带令牌）。 */
+export function splitHarUrl(raw) {
+  const text = typeof raw === 'string' ? raw : ''
+  try {
+    const url = new URL(text)
+    return {
+      host: url.host === '' ? '(no host)' : url.host,
+      path: url.pathname === '' ? '/' : url.pathname,
+      hadQuery: url.search !== '' || url.hash !== '',
+    }
+  } catch {
+    // 相对 URL / 不是 URL：退回正则取可读的那一段，**绝不整串透传**（整串里就带着 query）。
+    const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)([^?#]*)/iu.exec(text)
+    if (match === null) {
+      const bare = text.split(/[?#]/u)[0]
+      return { host: '(no host)', path: bare === '' ? '(no path)' : bare, hadQuery: /[?#]/u.test(text) }
+    }
+    return { host: match[1], path: match[2] === '' ? '/' : match[2], hadQuery: /[?#]/u.test(text) }
+  }
+}
+
+/** `mimeType` 归一：去掉 `; charset=…` 这类参数、转小写（分组要用它当键）。 */
+function harMime(response) {
+  const raw = response?.content?.mimeType
+  if (typeof raw !== 'string') return '(no mime)'
+  const base = raw.split(';')[0].trim().toLowerCase()
+  return base === '' ? '(no mime)' : base
+}
+
+/** `bytes` 的口径：`response.content.size` → `response.bodySize` → `null`（不猜）。 */
+function harBytes(response) {
+  for (const value of [response?.content?.size, response?.bodySize]) {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+  }
+  return null
+}
+
+function harTimeMs(entry) {
+  const value = entry?.time
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function harStatus(response) {
+  return typeof response?.status === 'number' && Number.isFinite(response.status) ? response.status : null
+}
+
+/**
+ * 一条 HAR entry → 归一化行。
+ *
+ * **只有这里列出的字段会出现在输出里**（白名单制）：headers / cookies / postData / body
+ * 连"被漏出去"的机会都没有 —— 这也是"最强的脱敏"唯一的落地方式：不复制，而不是复制后再擦。
+ */
+export function normalizeHarEntry(entry, index) {
+  const request = entry?.request ?? {}
+  const response = entry?.response ?? {}
+  const { host, path, hadQuery } = splitHarUrl(request.url)
+  const status = harStatus(response)
+  const errored = entry?._error !== undefined && entry?._error !== null
+  const method = typeof request.method === 'string' && request.method !== '' ? request.method.toUpperCase() : '(no method)'
+  return {
+    index,
+    method,
+    host,
+    path,
+    hadQuery,
+    status,
+    timeMs: harTimeMs(entry),
+    bytes: harBytes(response),
+    mime: harMime(response),
+    // status 0 = 请求根本没拿到响应（浏览器取消 / 连接失败），它同样是"错误条目"。
+    failed: status === 0 || errored,
+    key: `${method} ${host}${path}`,
+  }
+}
+
+/** 状态码计数：键按数值序（`0` → `200` → `404`），`(no status)` 这类非数值键排在最后。 */
+function harCounts(counts) {
+  const keys = [...counts.keys()].sort((left, right) => {
+    const a = Number(left)
+    const b = Number(right)
+    if (Number.isFinite(a) && Number.isFinite(b)) return a - b
+    return left.localeCompare(right)
+  })
+  return Object.fromEntries(keys.map(key => [key, counts.get(key)]))
+}
+
+/** 4xx/5xx，外加 status 0（没拿到响应）。 */
+export function isHarError(row) {
+  return row.failed === true || (row.status !== null && row.status >= 400)
+}
+
+/** 展示一行时的形状（**不含** headers / body / query）。 */
+function harRow(row) {
+  return { method: row.method, host: row.host, path: row.path, status: row.status, timeMs: row.timeMs, bytes: row.bytes, mime: row.mime }
+}
+
+/**
+ * 文件字节 → `{ file, har, entries }`。
+ *
+ * gzip **按 magic 判**（`1f 8b`）而不是扩展名：反过来（信扩展名）会让一份没压缩的 `.har.gz`
+ * 走进解压分支、报一个看不懂的错；BOM 在 `JSON.parse` 前剔除（有些导出器会带）。
+ */
+export function readHarDocument(buffer, path) {
+  const gzip = buffer.length > 1 && buffer[0] === 0x1f && buffer[1] === 0x8b
+  let payload = buffer
+  if (gzip) {
+    try {
+      payload = gunzipSync(buffer)
+    } catch (error) {
+      throw new Error(`${path} 带 gzip magic（1f 8b）却解压失败：${error.message} —— 文件可能被截断，或根本不是 gzip。`)
+    }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(payload.toString('utf8').replace(/^\uFEFF/u, ''))
+  } catch (error) {
+    throw new Error(`${path} 不是合法 JSON${gzip ? '（已按 gzip magic 解压）' : ''}：${error.message}`)
+  }
+  const entries = parsed?.log?.entries
+  if (!Array.isArray(entries)) {
+    throw new Error(`${path} 不像 HAR：log.entries 不是数组（HAR 1.2 的条目都在 log.entries 下）。`)
+  }
+  const creator = parsed.log.creator
+  return {
+    file: {
+      path,
+      bytes: buffer.length,
+      ...(gzip ? { uncompressedBytes: payload.length } : {}),
+      gzip,
+      sha256: createHash('sha256').update(buffer).digest('hex'),
+    },
+    har: {
+      version: typeof parsed.log.version === 'string' ? parsed.log.version : null,
+      creator: typeof creator?.name === 'string'
+        ? { name: creator.name, version: typeof creator.version === 'string' ? creator.version : null }
+        : null,
+    },
+    entries: entries.map((entry, index) => normalizeHarEntry(entry, index)),
+  }
+}
+
+/**
+ * 摘要：分组聚合（条数 / 字节 / 状态码分布）+ 最慢 N + 错误条目。
+ *
+ * 返回的是**未截断**的全量列表 —— 截断由调用方按 `top` 做，并且必须把省略了几个报出来。
+ * 排序一律是**确定**的（条数 → 字节 → 键名 / 耗时 → 键名）：同一份 HAR 两次跑出不同的
+ * "最热分组"，对比就没有意义了。
+ */
+export function summarizeHarEntries(entries, groupBy = 'host') {
+  const grouped = new Map()
+  for (const row of entries) {
+    const key = groupBy === 'status'
+      ? (row.status === null ? '(no status)' : String(row.status))
+      : groupBy === 'mime' ? row.mime : row.host
+    const group = grouped.get(key) ?? { key, entries: 0, bytes: 0, bytesUnknown: 0, statuses: new Map() }
+    group.entries += 1
+    if (row.bytes === null) group.bytesUnknown += 1
+    else group.bytes += row.bytes
+    const status = row.status === null ? '(no status)' : String(row.status)
+    group.statuses.set(status, (group.statuses.get(status) ?? 0) + 1)
+    grouped.set(key, group)
+  }
+  const groups = [...grouped.values()]
+    .map(group => ({
+      key: group.key,
+      entries: group.entries,
+      bytes: group.bytes,
+      bytesUnknown: group.bytesUnknown,
+      statuses: harCounts(group.statuses),
+    }))
+    .sort((left, right) => right.entries - left.entries || right.bytes - left.bytes || left.key.localeCompare(right.key))
+  const slowest = entries
+    .filter(row => row.timeMs !== null)
+    .sort((left, right) => right.timeMs - left.timeMs || left.key.localeCompare(right.key))
+  const errors = entries
+    .filter(isHarError)
+    .sort((left, right) => (right.status ?? -1) - (left.status ?? -1) || (right.timeMs ?? -1) - (left.timeMs ?? -1) || left.key.localeCompare(right.key))
+  return { groups, slowest, errors, withoutTime: entries.length - slowest.length }
+}
+
+/** 同一个键下的多条请求折叠成一份可比对的小结。 */
+function harAggregate(rows) {
+  const statuses = new Map()
+  let bytes = 0
+  let bytesUnknown = 0
+  let maxTimeMs = null
+  for (const row of rows) {
+    const status = row.status === null ? '(no status)' : String(row.status)
+    statuses.set(status, (statuses.get(status) ?? 0) + 1)
+    if (row.bytes === null) bytesUnknown += 1
+    else bytes += row.bytes
+    if (row.timeMs !== null) maxTimeMs = maxTimeMs === null ? row.timeMs : Math.max(maxTimeMs, row.timeMs)
+  }
+  return {
+    entries: rows.length,
+    statuses: harCounts(statuses),
+    bytes,
+    bytesUnknown,
+    // 字节一个都没读到时不编档位：`unknown` 才是诚实的答案。
+    bucket: harSizeBucket(bytesUnknown === rows.length ? null : bytes),
+    maxTimeMs,
+  }
+}
+
+function harIndex(entries) {
+  const index = new Map()
+  for (const row of entries) {
+    const rows = index.get(row.key) ?? []
+    rows.push(row)
+    index.set(row.key, rows)
+  }
+  return index
+}
+
+const harCompareRow = rows => ({
+  key: rows[0].key,
+  method: rows[0].method,
+  host: rows[0].host,
+  path: rows[0].path,
+  ...harAggregate(rows),
+})
+
+/**
+ * 两次捕获的对比，键是 `method + host + path`。
+ *
+ * `changed` 只认两件事：**状态码分布**变了，或大小**档位**变了（逐字节比会天天报差异，
+ * 档位才是"变了没有"的判据）。同一个键出现多次时按该键的全部条目折叠后再比 —— 否则
+ * "第一次 200、重试 500"这种最常见的形状会被压成一条而看不出来。
+ */
+export function compareHarEntries(baseEntries, otherEntries) {
+  const base = harIndex(baseEntries)
+  const other = harIndex(otherEntries)
+  const added = []
+  const removed = []
+  const changed = []
+  let unchanged = 0
+  for (const [key, rows] of other) {
+    if (!base.has(key)) added.push(harCompareRow(rows))
+  }
+  for (const [key, rows] of base) {
+    if (!other.has(key)) {
+      removed.push(harCompareRow(rows))
+      continue
+    }
+    const before = harAggregate(rows)
+    const after = harAggregate(other.get(key))
+    const why = []
+    if (JSON.stringify(before.statuses) !== JSON.stringify(after.statuses)) why.push('status')
+    if (before.bucket !== after.bucket) why.push('size')
+    if (why.length === 0) {
+      unchanged += 1
+      continue
+    }
+    changed.push({ key, method: rows[0].method, host: rows[0].host, path: rows[0].path, why, before, after })
+  }
+  const byKey = (left, right) => left.key.localeCompare(right.key)
+  return {
+    added: added.sort(byKey),
+    removed: removed.sort(byKey),
+    changed: changed.sort(byKey),
+    unchanged,
+    counts: { added: added.length, removed: removed.length, changed: changed.length, unchanged },
+  }
+}
+
+/** 按 `top` 切一刀，并把"切掉了几个"一起返回（省略绝不藏起来）。 */
+function harBound(rows, top) {
+  const shown = rows.slice(0, top)
+  return { rows: shown, bounds: { shown: shown.length, total: rows.length, omitted: rows.length - shown.length } }
+}
+
+/**
+ * 这份摘要**看不见什么** —— 照 §5 的最小证据形状，逐条写给模型（也写给以后改这个工具的人：
+ * 每加一个数字字段，都要在这里回答"它的口径是什么、缺数据时是什么样"）。
+ */
+function harLimitations({ withQuery, withoutTime, compare, truncated, top }) {
+  const lines = [
+    '离线读文件：不发起任何网络请求、不改本机状态。',
+    '未分析 headers 与 body：输出里不含任何请求/响应头、Cookie、postData 或 body 内容（白名单式脱敏，不是输出前擦除）。',
+    `URL 的 query 与 fragment 不入键、不输出（本次 ${withQuery} 条 URL 带 query/fragment，已剔除）。`,
+    'bytes 取 response.content.size（缺失时 response.bodySize），只算响应体；缺失记 null 并计入 bytesUnknown，不当 0。',
+    `耗时取 HAR 里记录的 entry.time（毫秒），不是本次重测；${withoutTime} 条没有该字段，不参与最慢排名。`,
+    'errors = 4xx/5xx，外加 status 0（请求没拿到响应，例如被取消或连接失败）。',
+  ]
+  if (compare) lines.push(`对比键是 method + host + path，大小档位按同一键的响应体合计分桶（${HAR_SIZE_BUCKET_TEXT}）。`)
+  if (truncated) lines.push(`输出被 top=${top} 截断：看每一段的 bounds（shown/total/omitted），这不是全量。`)
+  return lines
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // §B6 授权闸门
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -824,6 +1168,8 @@ const GATE_TABLE = {
   bx_ca: { readOnly: ['status', 'command', 'verify'] },
   // 只读：离线读 mitmproxy dump。
   bx_flows: { readOnly: ['hosts', 'list', 'show', 'grep'] },
+  // 只读：离线读 HAR（摘要 / 两份对比），没有 action 参数。
+  bx_har: { actionless: true },
   // 没有 action 参数，只读两份 JSON。
   bx_diff: { actionless: true },
 }
@@ -832,7 +1178,7 @@ function gateReason(tool, action) {
   const known = Object.hasOwn(GATE_TABLE, tool)
   return `fly-blackbox: \`${tool}\` 的 \`${action ?? ''}\` 会改变本机状态（起代理 / 主动探测 / 动系统代理），`
     + '属于**改动路径**，必须显式授权：设 FLY_ALLOW_INTERCEPT=1 再调用。'
-    + '只读路径（bx_proxy status、bx_sysproxy status、bx_ca *、bx_flows *、bx_diff）不受这道门管。'
+    + '只读路径（bx_proxy status、bx_sysproxy status、bx_ca *、bx_flows *、bx_har、bx_diff）不受这道门管。'
     + (known ? '' : `（\`${tool}\` 没有在授权表 GATE_TABLE 里登记，按 fail-closed 处理：登记它之前一律受控。）`)
 }
 
@@ -1336,7 +1682,7 @@ export function apply(ctx) {
   // ── bx_flows ─────────────────────────────────────────────────────────────
   ctx.tools.register(defineTool({
     name: 'bx_flows',
-    description: 'Read a mitmproxy dump offline (hosts | list | show | grep). Reads through the shell seam, refuses truncated output, and gates on the flow format version.',
+    description: 'Read a mitmproxy dump offline (hosts | list | show | grep).',
     parameters: {
       action: { type: 'string', required: true, description: 'hosts | list | show | grep' },
       path: { type: 'string', description: 'dump path, default <workspace>/.fly-blackbox/flows.mitm' },
@@ -1412,6 +1758,86 @@ export function apply(ctx) {
         ].filter(Boolean).join('\n')
       }
       return `unparsable action ${JSON.stringify(action)} — 只能是 hosts / list / show / grep`
+    },
+  }))
+
+  // ── bx_har ───────────────────────────────────────────────────────────────
+  ctx.tools.register(defineTool({
+    name: 'bx_har',
+    description: 'Summarize a HAR capture offline (entry counts, groups, slowest entries, 4xx/5xx); optionally diff two captures by method+host+path. Never includes headers or bodies.',
+    parameters: {
+      path: { type: 'string', required: true, description: 'HAR file path (.har or .har.gz; gzip is detected by its magic bytes)' },
+      compareWith: { type: 'string', description: 'second HAR file; adds an added/removed/changed diff against path' },
+      groupBy: { type: 'string', description: 'host | status | mime, default host' },
+      top: { type: 'number', description: 'max rows per list, default 20; anything omitted is counted under bounds' },
+    },
+    output: stringOutput,
+    async execute(args, exec) {
+      const path = typeof args.path === 'string' ? args.path.trim() : ''
+      if (path === '') throw new Error('bx_har 需要 path（.har 或 .har.gz 的路径）')
+      const groupBy = args.groupBy ?? 'host'
+      if (!HAR_GROUPINGS.includes(groupBy)) {
+        throw new Error(`bx_har 的 groupBy 只能是 ${HAR_GROUPINGS.join(' / ')}：给了 ${JSON.stringify(args.groupBy)}`)
+      }
+      const top = args.top === undefined ? HAR_DEFAULT_TOP : args.top
+      if (typeof top !== 'number' || !Number.isInteger(top) || top < 1) {
+        throw new Error(`bx_har 的 top 必须是 ≥1 的整数：给了 ${JSON.stringify(args.top)}`)
+      }
+
+      const base = await readHarFile(shell, exec, path, 'HAR')
+      const summary = summarizeHarEntries(base.entries, groupBy)
+      const groups = harBound(summary.groups, top)
+      const slowest = harBound(summary.slowest, top)
+      const errors = harBound(summary.errors, top)
+
+      const result = {
+        file: base.file,
+        har: base.har,
+        total: base.entries.length,
+        groupBy,
+        groups: groups.rows,
+        slowest: slowest.rows.map(harRow),
+        errors: errors.rows.map(row => ({ ...harRow(row), failed: row.failed })),
+        top,
+        bounds: {
+          groups: groups.bounds,
+          slowest: slowest.bounds,
+          errors: errors.bounds,
+        },
+      }
+
+      const comparePath = typeof args.compareWith === 'string' ? args.compareWith.trim() : ''
+      if (comparePath !== '') {
+        const other = await readHarFile(shell, exec, comparePath, '对比 HAR')
+        const compared = compareHarEntries(base.entries, other.entries)
+        const added = harBound(compared.added, top)
+        const removed = harBound(compared.removed, top)
+        const changed = harBound(compared.changed, top)
+        result.compare = {
+          base: base.file,
+          other: other.file,
+          total: { base: base.entries.length, other: other.entries.length },
+          counts: compared.counts,
+          added: added.rows,
+          removed: removed.rows,
+          changed: changed.rows,
+          bounds: { added: added.bounds, removed: removed.bounds, changed: changed.bounds },
+        }
+      }
+
+      const omitted = [
+        ...Object.values(result.bounds),
+        ...(result.compare === undefined ? [] : Object.values(result.compare.bounds)),
+      ].reduce((total, bound) => total + bound.omitted, 0)
+      result.truncated = omitted > 0
+      result.limitations = harLimitations({
+        withQuery: base.entries.filter(row => row.hadQuery).length,
+        withoutTime: summary.withoutTime,
+        compare: result.compare !== undefined,
+        truncated: result.truncated,
+        top,
+      })
+      return JSON.stringify(result, null, 2)
     },
   }))
 

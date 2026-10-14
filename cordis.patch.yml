@@ -1,5 +1,5 @@
 # 由仓库脚本生成，别手改：node scripts/build-fly-mode-bundle.mjs --out <本文件>
-# 两个 preset：Fly 安全模式（preset-fly，7 个安全工具内联 + smart）与
+# 两个 preset：Fly 安全模式（preset-fly，8 个安全工具内联 + smart）与
 # Fly 标准模式（preset-fly-standard，上游 standard 的行表 + 同一行 smart，无安全工具）。
 # 同源：安全模式那段声明来自 scripts/lib/fly-profile.mjs 的 seedAgentPreset()（dev 装配写进 profile 的
 # 是同一条）；8 个工具的行名被改写成**本包的子路径**（tools/**，随包一起发布）。
@@ -159,6 +159,10 @@
             group: true
             isolate:
               planMode: true
+              # 评审姿态自己的服务（ReviewModeController 用 super(ctx,'reviewMode') **提供**服务 ⇒
+              # 必须坐在带 isolate realm 的 group 里；否则它往 root realm 发布，挂载即被拒 —— 实测报错原文：
+              # "Preset services require isolate realms: reviewMode"）。
+              reviewMode: true
             config:
               - id: plan-mode
                 name: '@deepseek-ai/dsh-plan-mode'
@@ -176,6 +180,15 @@
 
                         When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
 
+              # 评审姿态（docs/fly-review-mode-plan.md）：`/review` 开关一段只读引导（先讲阻塞问题、
+              # 每条结论带 path:line 证据），收口工具 `exit_review_mode` 把判词交用户裁决。
+              # 形状与上面的 plan-mode 同族：姿态的效果就是一段引导 ⇒ 进/出只改提示词段、不改工具目录；
+              # 状态记会话日志 ⇒ resume / fork 不丢。**只读是引导、不是强制**（沙箱与审批策略独立执行）。
+              # 行保持**裸名**（内联形状的契约）：生成器认这个裸名，再把它改写成模式包内的
+              # `dsh-plugin-fly-mode/tools/dsh-plugin-fly-review/index.js`（同那 8 个内联工具行）；
+              # 包内的源码布局则是 `tools/index.js`（内联器照这个路径拷贝）。
+              - id: tool-fly-review
+                name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-review/index.js'
           # ── compaction ──────────────────────────────────────────────────────────────
 
           # `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner must
@@ -324,8 +337,8 @@
             name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-diag/index.js'
           - id: tool-fly-recon
             name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-recon/index.js'
-          # 客户端黑盒排查链（微信小程序实战沉淀）：`bx_proxy` / `bx_flows` / `bx_diff` /
-          # `bx_doctor` / `bx_ca` / `bx_sysproxy` 六个工具 + 包内 `client-blackbox` skill 资产。
+          # 客户端黑盒排查链（微信小程序实战沉淀）：`bx_proxy` / `bx_flows` / `bx_har` / `bx_diff` /
+          # `bx_doctor` / `bx_ca` / `bx_sysproxy` 七个工具 + 包内 `client-blackbox` skill 资产。
           # 行形状与上面几个 `tool-fly-*` 完全一致（`id` + `name`，**不**写 `inject`）：
           # 声明面由包自己的 `export const inject` 决定（本包是 `['tools','shell','skills']`）。
           # 为什么要在注释里点明 `skills`：skill provider 是在 `apply(ctx)` 里用
@@ -336,6 +349,14 @@
           # 起停代理 / 主动探测 / 改系统代理走 `FLY_ALLOW_INTERCEPT=1` 授权门；只读面永远可用。
           - id: tool-fly-blackbox
             name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-blackbox/index.js'
+          # 打包产物的静态重建（规划 §3.2，P1）：`artifact_asar_inventory`（ASAR 清单：头布局 / 条目数与
+          # 大小 / package.json 的 main / *.node 关键成员 / 整档 sha256）与 `artifact_js_boundaries`
+          # （解包 JS 树或 asar 里 .js 成员的**字面量**边界：fetch / XHR / WebSocket / URL 字面量与
+          # Electron IPC 通道名，每条带 file:line，并显式报覆盖率与截断）。行形状同上（`id` + `name`）。
+          # 本包 `inject = ['tools','shell']` —— 只用沙箱化的 shell 接缝读文件，不注册 skill，
+          # 所以**不**是 blackbox 那种三项声明面（多写一项 = 申请用不上的服务）。
+          - id: tool-fly-artifact
+            name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-artifact/index.js'
           # ── fly smart mode ───────────────────────────────────────────────────────────
 
           # Smart 模式（docs/smart-mode-design.md）：先设计、后执行、再验收的双模型工作流。

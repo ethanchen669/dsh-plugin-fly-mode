@@ -118,7 +118,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'recon_ports',
-    description: 'TCP connect scan of ports on a lab target: nmap when installed, else the system nc (authorized use only).',
+    description: 'TCP connect scan of ports on a lab target (authorized use only).',
     parameters: {
       host: { type: 'string', required: true },
       ports: { type: 'string', description: 'Comma list with optional ranges, default top common' },
