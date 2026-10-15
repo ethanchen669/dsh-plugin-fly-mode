@@ -39,6 +39,12 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
  *
  * 两个入口都在 P1 的"结论要能回指源码位置"那条要求下：清单的每条成员给**相对路径**，
  * 边界的每条命中给 **file:line**。
+ *
+ * **起因**（为什么这个包存在）：`morluto/rea` 那边有 APK/JADX、固件/Binwalk、.NET、**JS/ASAR 与 HAR**
+ * 这些"看得懂打包产物"的能力，而 fly 这边此前只有原生二进制三件套 —— 一个 Electron 应用的
+ * 150MB `app.asar` 摆在面前，只能靠 `bin_strings` 碰运气。安全模式的定位是客户端黑盒排查，
+ * 所以这一面必须在拆仓之前补上（规划 §3.2）：先把"清单 + 字面量边界"两层做出来，
+ * 再谈 AST 与 CDP（P2）。**不抄代码，只在设计上对齐**（分层、覆盖率、bounds 三件）。
  */
 
 export const name = 'fly-artifact'
@@ -59,6 +65,19 @@ function shq(value) {
  * version. `scripts/verify-security-tools.mjs` now fails loudly if a call site
  * names a seam method the executor does not have.
  */
+/**
+ * 路径参数规范化：以 `-` 开头的路径加 `./` 前缀（2026-10-13）。
+ *
+ * 为什么不插 `--`：实测本机（macOS，发布目标平台）**objdump（-h/-d/-T）/ base64 -i / otool -hv 都不支持
+ * `--`**，插进去直接失败；而 `file -b --version` 会打印 `file-5.41`、`nm -u --version` 会打印
+ * `llvm-nm, …`，两者都 **exit 0** ⇒ 工具会把版本串当**数据**返回。加 `./` 之后它就是一个普通相对路径：
+ * 不存在就正常报错，存在就是那个文件。
+ */
+function safePath(value) {
+  const text = String(value ?? '')
+  return text.startsWith('-') ? './' + text : text
+}
+
 async function runCmd(shell, argv, exec, opts = {}) {
   const result = await (await shell.execute(shell.resolve({
     command: argv.map(shq).join(' '),
@@ -632,7 +651,7 @@ export function apply(ctx) {
     },
     output: stringOutput,
     async execute(args, exec) {
-      const path = typeof args.path === 'string' ? args.path.trim() : ''
+      const path = safePath(typeof args.path === 'string' ? args.path.trim() : '')
       if (path === '') throw new Error('artifact_asar_inventory 需要 path（.asar 的路径）')
       const top = readTop(args.top, 'artifact_asar_inventory')
 
@@ -770,7 +789,7 @@ export function apply(ctx) {
     },
     output: stringOutput,
     async execute(args, exec) {
-      const path = typeof args.path === 'string' ? args.path.trim() : ''
+      const path = safePath(typeof args.path === 'string' ? args.path.trim() : '')
       if (path === '') throw new Error('artifact_js_boundaries 需要 path（.asar 的路径，或解包后的 JS 目录）')
       const top = readTop(args.top, 'artifact_js_boundaries')
       const scope = args.scope === undefined ? 'app' : args.scope

@@ -5,6 +5,14 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
  * Registers model-facing analysis tools on ctx.tools. All command execution
  * goes through the host `shell` capability seam so the sandbox confines it;
  * a tool never shells out via node:child_process directly.
+ *
+ * **失败面的口径是"大声"**（Q5）：缺 `readelf`/`objdump`/`strings`/`file`/`wc` 时**不静默降级** ——
+ *   · 能在仓库内补的就补：没有 GNU readelf 就用**仓库内置的原生解析器**算头部/段/动态（并在
+ *     结果的 `limitations` 里明说"这是内置解析器算的，不是 readelf 的输出"）；
+ *   · 补不了的就**抛**：`requireOk` 让缺命令以 `CommandError` 报出来（历史教训：`pwn_checksec`
+ *     曾在缺工具时静默回退，对**任何**二进制都报 `pie=no`）；
+ *   · "没有"要**说成没有**：`bin_strings` 一条都没匹配时返回"no printable strings matching …"，
+ *     绝不返回空串（空串会被读成"这个文件没有字符串"）；节表读不到时同理。
  */
 export const name = 'fly-binary'
 export const inject = ['tools', 'shell']
@@ -24,6 +32,19 @@ function shq(value) {
  * version. `scripts/verify-security-tools.mjs` now fails loudly if a call site
  * names a seam method the executor does not have.
  */
+/**
+ * 路径参数规范化：以 `-` 开头的路径加 `./` 前缀（2026-10-13）。
+ *
+ * 为什么不插 `--`：实测本机（macOS，发布目标平台）**objdump（-h/-d/-T）/ base64 -i / otool -hv 都不支持
+ * `--`**，插进去直接失败；而 `file -b --version` 会打印 `file-5.41`、`nm -u --version` 会打印
+ * `llvm-nm, …`，两者都 **exit 0** ⇒ 工具会把版本串当**数据**返回（`bin_sections { path: '--version' }`
+ * 真发生过）。加 `./` 之后它就是一个普通相对路径：不存在就正常报错，存在就是那个文件。
+ */
+function safePath(value) {
+  const text = String(value ?? '')
+  return text.startsWith('-') ? './' + text : text
+}
+
 async function runCmd(shell, argv, exec, opts = {}) {
   const result = await (await shell.execute(shell.resolve({
     command: argv.map(shq).join(' '),
@@ -54,9 +75,19 @@ async function runCmd(shell, argv, exec, opts = {}) {
  */
 function requireOk(run, what) {
   if (run.exitCode === 0) return run.stdout
-  const detail = run.stderr.trim().split('\n').map(line => line.trim()).filter(Boolean).slice(0, 3).join(' | ')
-  const missing = run.exitCode === 127 || /command not found/iu.test(run.stderr) ? ' — the command is not installed on this host' : ''
-  const error = new Error(`${what} failed (exit ${run.exitCode})${missing}: ${run.command}${detail === '' ? '' : `\n${detail}`}`)
+  // 沙箱拒绝的形状是**结果正文里的标记**（`[sandbox: file access denied under <mode> mode]`，
+  // 抄自 @deepseek-ai/dsh-sandbox/index.js:65）—— 它落在 stdout 上；只读 stderr 就会把它丢掉，
+  // 于是模型读到的是「命令失败」，而不是「你没有被授权」。所以标记必须原样带进错误文案。
+  const sandboxMark = /^\[sandbox: .*\]$/mu.exec(run.stdout)
+  const detail = [sandboxMark?.[0], ...run.stderr.trim().split('\n').map(line => line.trim()).filter(Boolean)].slice(0, 3).join(' | ')
+  const notInstalled = run.exitCode === 127 || /command not found/iu.test(run.stderr)
+  const missing = notInstalled ? ' — the command is not installed on this host' : ''
+  // 失败文案要对**读它的模型**可行动（Q6）：不是裸 stderr，但也不许臆断原因 ——
+  // 只给「这条 exit 属于哪一类」与「下一步可以试什么」，具体判断仍留给读的人。
+  const next = notInstalled
+    ? 'next: this host lacks that command — look for a built-in fallback in this package, or read the file another way'
+    : 'next: check the path, and that the file is what this tool expects (bin_file shows what it is); the line above is the command own reason'
+  const error = new Error(`${what} failed (exit ${run.exitCode})${missing}: ${run.command}${detail === '' ? '' : `\n${detail}\n${next}`}`)
   error.name = 'CommandError'
   throw error
 }
@@ -432,10 +463,23 @@ export function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute(args, exec) {
-      const wc = await runCmd(shell, ['wc', '-c', args.path], exec)
+      const path = safePath(args.path)
+      const wc = await runCmd(shell, ['wc', '-c', path], exec)
       const size = requireOk(wc, 'wc -c').trim().split(/\s+/)[0] ?? '0'
-      const identify = await runCmd(shell, ['file', '-b', args.path], exec)
-      return `size=${size}\n${requireOk(identify, 'file -b').trim()}`
+      const identify = await runCmd(shell, ['file', '-b', path], exec)
+      // 证据形状（规划 §5.1）：信封 JSON，原文本原样进 observed.dump。
+      const text = `size=${size}\n${requireOk(identify, 'file -b').trim()}`
+      return JSON.stringify({
+        tool: 'bin_file',
+        target: args.path,
+        operation: 'one wc -c + one file -b (no parsing of the file content)',
+        observed: { bytes: Number(size), dump: text },
+        confidence: 'observed',
+        limitations: [
+          '只报 wc -c 的字节数与 file(1) 的判断：**不解析文件内部**（要字段另用 bin_readelf / bin_sections）',
+          'file(1) 的判断来自魔数与片段匹配：损坏或被裁剪的文件也可能被认成某种格式',
+        ],
+      }, null, 2)
     },
   }))
 
@@ -453,18 +497,39 @@ export function apply(ctx) {
     },
     async execute(args, exec) {
       const min = String(args.min ?? 4)
-      const run = await runCmd(shell, ['strings', '-n', min, args.path], exec, { stdoutMaxBytes: 1048576 })
+      const path = safePath(args.path)
+      const run = await runCmd(shell, ['strings', '-n', min, path], exec, { stdoutMaxBytes: 1048576 })
       let lines = requireOk(run, `strings -n ${min}`).split('\n').filter(Boolean)
       if (args.grep) {
         const g = args.grep.toLowerCase()
         lines = lines.filter((l) => l.toLowerCase().includes(g))
       }
       if (lines.length === 0) {
-        return args.grep === undefined
-          ? `no printable strings of length ${min} or more in ${args.path}`
-          : `no printable strings matching ${JSON.stringify(args.grep)} (min length ${min}) in ${args.path}`
+        return JSON.stringify({
+          tool: 'bin_strings',
+          target: args.path,
+          operation: `strings -n ${min}` + (args.grep === undefined ? '' : ` filtered by ${JSON.stringify(args.grep)}`),
+          observed: { matched: 0, min: Number(min), grep: args.grep ?? null, dump: args.grep === undefined
+            ? `no printable strings of length ${min} or more in ${args.path}`
+            : `no printable strings matching ${JSON.stringify(args.grep)} (min length ${min}) in ${args.path}` },
+          confidence: 'observed',
+          limitations: [
+            '一条都没匹配上 ⇒ 这是「没有这样的字符串」，不是「这个文件里没有字符串」',
+            'strings(1) 只看可打印字节序列：加密/压缩/UTF-16 里的字符串它看不到',
+          ],
+        }, null, 2)
       }
-      return lines.slice(0, 400).join('\n')
+      return JSON.stringify({
+        tool: 'bin_strings',
+        target: args.path,
+        operation: `strings -n ${min}` + (args.grep === undefined ? '' : ` filtered by ${JSON.stringify(args.grep)}`),
+        observed: { matched: lines.length, shown: Math.min(lines.length, 400), min: Number(min), grep: args.grep ?? null, dump: lines.slice(0, 400).join('\n') },
+        confidence: 'observed',
+        limitations: [
+          lines.length > 400 ? '只给前 400 条（observed.matched 是匹配总数）：要更多就加 grep 缩小范围' : '这次没有截断（匹配数 ≤ 400）',
+          'strings(1) 只看可打印字节序列：加密/压缩/UTF-16 里的字符串它看不到',
+        ],
+      }, null, 2)
     },
   }))
 
@@ -480,26 +545,48 @@ export function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute(args, exec) {
+      // 证据形状（规划 §5.1）：四个分支都产出同一个信封；两条方法（GNU readelf / 仓库内置解析器）
+      // 必须写进 limitations，否则"本机没有 readelf"会被读成"这份 ELF 就是这样"。
+      const envelope = (observed, limitations) => JSON.stringify({
+        tool: 'bin_readelf',
+        target: args.path,
+        operation: `read ELF ${mode} (${flag}) and report it verbatim or via the built-in reader)`,
+        observed,
+        confidence: 'observed',
+        limitations,
+      }, null, 2)
       const mode = args.mode === 'segments' || args.mode === 'dynamic' ? args.mode : 'headers'
       const flag = mode === 'segments' ? '-l' : mode === 'dynamic' ? '-d' : '-h'
       // GNU binutils is not part of macOS. When readelf is absent (or refuses the
       // file) the ELF is parsed here instead: the previous revision threw
       // "command not found" on every Mac, which made four of the five binary
       // tools useless on the platform this app ships for.
-      const real = await runCmd(shell, ['readelf', flag, args.path], exec)
-      if (real.exitCode === 0 && real.stdout.trim() !== '') return real.stdout
-      const elf = await elfProbe(rawRun(shell, exec), args.path)
+      const path = safePath(args.path)
+      const real = await runCmd(shell, ['readelf', flag, path], exec)
+      if (real.exitCode === 0 && real.stdout.trim() !== '') {
+        return envelope({ method: 'readelf', dump: real.stdout }, [
+          'GNU readelf 的输出原样返回，本工具不改写它',
+        ])
+      }
+      const elf = await elfProbe(rawRun(shell, exec), path)
       if (elf === null) {
-        const kind = requireOk(await runCmd(shell, ['file', '-b', args.path], exec), 'file -b').trim()
-        return [
+        const kind = requireOk(await runCmd(shell, ['file', '-b', path], exec), 'file -b').trim()
+        return envelope({ method: null, dump: [
           `readelf ${flag} is unavailable on this host (${real.exitCode === 127 ? 'not installed' : `exit ${real.exitCode}`})`,
           `${args.path} is not ELF, so a native ELF reader has nothing to report either — file(1) says: ${kind}`,
           'for Mach-O use rev_disasm / rev_imports (objdump, otool and nm ship with macOS)',
-        ].join('\n')
+        ].join('\n') }, [
+          '本机没有可用的 readelf，而这个文件也不是 ELF ⇒ 两条路都给不出读数（observed.dump 里是原因）',
+        ])
       }
-      if (mode === 'segments') return renderElfSegments(elf)
-      if (mode === 'dynamic') return await renderElfDynamic(elf)
-      return renderElfHeader(elf)
+      // 本机没有 GNU readelf ⇒ 下面三支都是**仓库内置解析器**算的，limitations 要说清。
+      const native = [
+        '本机没有 GNU readelf（macOS 不带 binutils）⇒ 这份读数是仓库内置原生解析器算的，不是 readelf 的输出',
+        '内置解析器只覆盖本工具声明的字段；readelf 的其它开关（--notes/--relocs 等）它不做',
+      ]
+      if (mode === 'segments') return envelope({ method: 'native', dump: renderElfSegments(elf) }, native)
+      if (mode === 'dynamic') return envelope({ method: 'native', dump: await renderElfDynamic(elf) }, native)
+      return envelope({ method: 'native', dump: renderElfHeader(elf) }, native)
     },
   }))
 
@@ -517,11 +604,12 @@ export function apply(ctx) {
       // 证据形状（规划 §5.1 的第一个试点）：返回值是**信封 JSON**，不再是裸表格文本。
       // 真值判据不变（observed.dump 里是 objdump 原文），新增 confidence 与 limitations ——
       // 逼这个工具回答"这个结论看不见什么"（本仓最贵的那条教训）。
-      const run = await runCmd(shell, ['objdump', '-h', args.path], exec)
+      const path = safePath(args.path)
+      const run = await runCmd(shell, ['objdump', '-h', path], exec)
       const ok = run.exitCode === 0 && run.stdout.trim() !== ''
       // GNU binutils is not part of macOS. Instead of an opaque "command not found",
       // say which method failed and what to use instead (same shape as bin_readelf).
-      const kind = ok ? null : await runCmd(shell, ['file', '-b', args.path], exec)
+      const kind = ok ? null : await runCmd(shell, ['file', '-b', path], exec)
       return JSON.stringify({
         tool: 'bin_sections',
         target: args.path,

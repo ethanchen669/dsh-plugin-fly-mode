@@ -11,8 +11,8 @@
   - **Fly 标准模式** `preset-fly-standard`（行表 = **上游 `standard` 的行表** + 一行 smart，33 行）——
     由生成器从**引擎自己的组合结果**里取上游行表（不手抄），所以引擎升级后行表跟着走、漂了 `--check` 会红。
   其中
-  **7 个 Fly 工具**（binary / reverse / pwn / diag / recon / blackbox / guard）的源码**内联在包内
-  `tools/`**，行表用**本包子路径**引用它们 —— 装这个包**不会**在 npm 上再拉这 7 个包；
+  **8 个 Fly 工具**（binary / reverse / pwn / diag / recon / blackbox / artifact / guard）的源码**内联在包内
+  `tools/`**，行表用**本包子路径**引用它们 —— 装这个包**不会**在 npm 上再拉这 8 个包；
   **`fly-smart` 单独一个 plugin**：它是本包 `dependencies` 里**唯一**一项，行表保持裸名，
   由 npm 装进 profile 的 `node_modules`（它变化最快，且与工作台面板是一个整体，不适合内联）。
 - **不是**：不带 `dsh.client`（模式是 agent 平面，没有浏览器半边）；不带 Fly 工作台
@@ -76,7 +76,7 @@ dsh plugin --profile=web add @dsh-fly/dsh-plugin-fly-mode@0.1.3 --registry=https
 
 ## 仓库状态（2026-10-11）
 
-- 形状定稿：一条 `- insert:` 声明 + 包内 `tools/`（7 个工具内联，行表用本包子路径引用）+
+- 形状定稿：一条 `- insert:` 声明 + 包内 `tools/`（8 个工具内联，行表用本包子路径引用）+
   `dsh-plugin-fly-smart` 作为**唯一** npm 依赖。声明由 `dsh-fly` 仓的
   `scripts/build-fly-mode-bundle.mjs` 生成，门禁用 `--check` 断漂移（含多出来的文件）。
 - `.github/workflows/{ci,release}.yml` **已适配本仓**（纯声明包：不装依赖、直接跑

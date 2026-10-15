@@ -6,7 +6,6 @@
 # 门禁用 --check 断言本文件与 tools/** 都 == 生成器输出。
 # 不含三模型路由（用户机器状态）、不写 registry default（默认归上游 standard）。
 - insert:
-- insert:
     - id: preset-fly
       name: '@deepseek-ai/dsh-agent-preset'
       config:

@@ -306,6 +306,19 @@ function assertNotPrivileged(command) {
  * 这一点（本仓既有五个插件的 `runCmd` 正是这个写法；门禁桩现在按真接缝的形状发布
  * `result()`，所以这类"桩和真接缝不同形"的假绿会在这一层被抓住）。
  */
+/**
+ * 路径参数规范化：以 `-` 开头的路径加 `./` 前缀（2026-10-13）。
+ *
+ * 为什么不插 `--`：实测本机（macOS，发布目标平台）**objdump（-h/-d/-T）/ base64 -i / otool -hv 都不支持
+ * `--`**，插进去直接失败；而 `file -b --version` 会打印 `file-5.41`、`nm -u --version` 会打印
+ * `llvm-nm, …`，两者都 **exit 0** ⇒ 工具会把版本串当**数据**返回。加 `./` 之后它就是一个普通相对路径：
+ * 不存在就正常报错，存在就是那个文件。
+ */
+function safePath(value) {
+  const text = String(value ?? '')
+  return text.startsWith('-') ? './' + text : text
+}
+
 async function runCmd(shell, argv, exec, opts = {}) {
   const command = typeof argv === 'string' ? argv : argv.map(shq).join(' ')
   assertNotPrivileged(command)
@@ -968,11 +981,17 @@ export function readHarDocument(buffer, path) {
   try {
     parsed = JSON.parse(payload.toString('utf8').replace(/^\uFEFF/u, ''))
   } catch (error) {
-    throw new Error(`${path} 不是合法 JSON${gzip ? '（已按 gzip magic 解压）' : ''}：${error.message}`)
+    // Q6（2026-10-13）：失败文案要对读它的模型可行动 —— what + why + **what to try next**，
+    // 且不臆断具体原因（写错的「为什么」比没有更糟）。
+    throw new Error(`${path} 不是合法 JSON${gzip ? '（已按 gzip magic 解压）' : ''}：${error.message}`
+      + ' —— 修法：确认这是 HAR 导出（浏览器 DevTools 的 Save all as HAR，或 mitmproxy 的硬拷贝转 HAR）；' 
+      + '只做普通 JSON 校验的话，先看它是不是别的格式。')
   }
   const entries = parsed?.log?.entries
   if (!Array.isArray(entries)) {
-    throw new Error(`${path} 不像 HAR：log.entries 不是数组（HAR 1.2 的条目都在 log.entries 下）。`)
+    throw new Error(`${path} 不像 HAR：log.entries 不是数组（HAR 1.2 的条目都在 log.entries 下）。`
+      + ' —— 修法：重新导出一份 HAR，或确认导出的是 HAR 而不是本仓自己的 mitmproxy dump' 
+      + '（`.mitm` 那种用 bx_flows 读）。')
   }
   const creator = parsed.log.creator
   return {
@@ -1696,7 +1715,7 @@ export function apply(ctx) {
       const root = workspaceRoot(exec)
       const state = readState(root)
       const action = String(args.action ?? '')
-      const dump = args.path ?? state?.dump ?? join(root, '.fly-blackbox', 'flows.mitm')
+      const dump = safePath(args.path ?? state?.dump ?? join(root, '.fly-blackbox', 'flows.mitm'))
 
       const size = await statSizeVia(shell, exec, dump, 'dump')
       if (size > 32 * 1024 * 1024) {
@@ -1773,7 +1792,7 @@ export function apply(ctx) {
     },
     output: stringOutput,
     async execute(args, exec) {
-      const path = typeof args.path === 'string' ? args.path.trim() : ''
+      const path = safePath(typeof args.path === 'string' ? args.path.trim() : '')
       if (path === '') throw new Error('bx_har 需要 path（.har 或 .har.gz 的路径）')
       const groupBy = args.groupBy ?? 'host'
       if (!HAR_GROUPINGS.includes(groupBy)) {

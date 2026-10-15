@@ -18,7 +18,28 @@ function shq(value) {
  * `TypeError: shell.run is not a function` on every call, in every engine
  * version. `scripts/verify-security-tools.mjs` now fails loudly if a call site
  * names a seam method the executor does not have.
+ *
+ * **失败面的口径是"大声"**（Q5）：
+ *   · 没有 `checksec`（macOS 就是）⇒ 走**仓库内置的原生解析器**算 PIE/NX/RELRO/canary，并在
+ *     `limitations` 里明说"这是内置解析器算的"；**绝不**再出现"缺工具 ⇒ 静默回退 ⇒ 对所有文件
+ *     都报 pie=no"那种事故（2026-10-01 的原始缺陷正是它）；
+ *   · `pwn_cyclic` 的长度会被夹到 1..4096 —— 夹取是**读数**（`observed.clamped`），不是沉默；
+ *   · `pwn_rop_hint` **不看文件**：它的清单用 `confidence: 'inferred'` 标出来，并在 `limitations`
+ *     里写清"前提必须先由 pwn_checksec / rev_* / bin_* 验过"。
  */
+/**
+ * 路径参数规范化：以 `-` 开头的路径加 `./` 前缀（2026-10-13）。
+ *
+ * 为什么不插 `--`：实测本机（macOS，发布目标平台）**objdump（-h/-d/-T）/ base64 -i / otool -hv 都不支持
+ * `--`**，插进去直接失败；而 `file -b --version` 会打印 `file-5.41`、`nm -u --version` 会打印
+ * `llvm-nm, …`，两者都 **exit 0** ⇒ 工具会把版本串当**数据**返回。加 `./` 之后它就是一个普通相对路径：
+ * 不存在就正常报错，存在就是那个文件。
+ */
+function safePath(value) {
+  const text = String(value ?? '')
+  return text.startsWith('-') ? './' + text : text
+}
+
 async function runCmd(shell, argv, exec, opts = {}) {
   const result = await (await shell.execute(shell.resolve({
     command: argv.map(shq).join(' '),
@@ -50,9 +71,19 @@ async function runCmd(shell, argv, exec, opts = {}) {
  */
 function requireOk(run, what) {
   if (run.exitCode === 0) return run.stdout
-  const detail = run.stderr.trim().split('\n').map(line => line.trim()).filter(Boolean).slice(0, 3).join(' | ')
-  const missing = run.exitCode === 127 || /command not found/iu.test(run.stderr) ? ' — the command is not installed on this host' : ''
-  const error = new Error(`${what} failed (exit ${run.exitCode})${missing}: ${run.command}${detail === '' ? '' : `\n${detail}`}`)
+  // 沙箱拒绝的形状是**结果正文里的标记**（`[sandbox: file access denied under <mode> mode]`，
+  // 抄自 @deepseek-ai/dsh-sandbox/index.js:65）—— 它落在 stdout 上；只读 stderr 就会把它丢掉，
+  // 于是模型读到的是「命令失败」，而不是「你没有被授权」。所以标记必须原样带进错误文案。
+  const sandboxMark = /^\[sandbox: .*\]$/mu.exec(run.stdout)
+  const detail = [sandboxMark?.[0], ...run.stderr.trim().split('\n').map(line => line.trim()).filter(Boolean)].slice(0, 3).join(' | ')
+  const notInstalled = run.exitCode === 127 || /command not found/iu.test(run.stderr)
+  const missing = notInstalled ? ' — the command is not installed on this host' : ''
+  // 失败文案要对**读它的模型**可行动（Q6）：不是裸 stderr，但也不许臆断原因 ——
+  // 只给「这条 exit 属于哪一类」与「下一步可以试什么」，具体判断仍留给读的人。
+  const next = notInstalled
+    ? 'next: this host lacks that command — look for a built-in fallback in this package, or read the file another way'
+    : 'next: check the path, and that the file is what this tool expects (bin_file shows what it is); the line above is the command own reason'
+  const error = new Error(`${what} failed (exit ${run.exitCode})${missing}: ${run.command}${detail === '' ? '' : `\n${detail}\n${next}`}`)
   error.name = 'CommandError'
   throw error
 }
@@ -534,9 +565,35 @@ export function apply(ctx) {
       render: (_a, v) => [{ type: 'text', text: v }],
     },
     async execute(args, exec) {
-      const ck = await runCmd(shell, ['checksec', '--file=' + args.path], exec)
-      if (ck.exitCode === 0) return ck.stdout
-      return (await mitigationLines(shell, args.path, exec)).join('\n')
+      const path = safePath(args.path)
+      const ck = await runCmd(shell, ['checksec', '--file=' + path], exec)
+      if (ck.exitCode === 0) {
+        return JSON.stringify({
+          tool: 'pwn_checksec',
+          target: args.path,
+          operation: 'read mitigations with the installed checksec',
+          observed: { method: 'checksec', dump: ck.stdout },
+          confidence: 'observed',
+          limitations: [
+            'checksec 的输出原样返回（本工具不改写它）',
+            'checksec 的判断基于它自己支持的格式/段：**没提到的项不代表不存在**（要逐条核就用 bin_readelf）',
+          ],
+        }, null, 2)
+      }
+      // 本机没有 checksec（macOS 就是）：这份读数来自仓库内置的原生解析器。
+      const nativeLines = (await mitigationLines(shell, path, exec)).join('\n')
+      return JSON.stringify({
+        tool: 'pwn_checksec',
+        target: args.path,
+        operation: 'compute mitigations from the file itself (no checksec on this host)',
+        observed: { method: 'native', dump: nativeLines },
+        confidence: 'observed',
+        limitations: [
+          '**本机没有 checksec** ⇒ 这份读数是**仓库内置解析器**算的，不是 checksec 的输出',
+          '内置解析器只覆盖本工具声明的字段（arch/pie/nx/relro/canary）；checksec 的其它判断（如 fortify）它不做',
+          '它对 Mach-O 与 ELF 各有一套路子：看 method 与 dump 里的措辞，别把 macho 的 relro=n/a 读成"没开"',
+        ],
+      }, null, 2)
     },
   }))
 
@@ -552,7 +609,19 @@ export function apply(ctx) {
     },
     async execute(args) {
       const n = Math.max(1, Math.min(4096, Number(args.length) || 64))
-      return cyclic(n)
+      // 证据形状（规划 §5.1）：信封 JSON（模式本身进 observed，不塞进 dump 的文本里）。
+      return JSON.stringify({
+        tool: 'pwn_cyclic',
+        target: 'de Bruijn pattern',
+        operation: 'generate a cyclic pattern for offset discovery (pwntools-compatible alphabet)',
+        observed: { length: n, clamped: n !== (Number(args.length) || 64), dump: cyclic(n) },
+        confidence: 'observed',
+        limitations: [
+          '模式只帮你**定位**偏移：它不告诉你偏移在哪，也不说明那条路径可达（配合真实崩溃日志/调试器才有意义）',
+          '长度会被夹到 1..4096：传大了会**静默变短** ⇒ 用 observed.length（或 clamped=true）核对实际给的位数',
+          '字母表与 pwntools 的 cyclic 一致，但**只保证前缀相同**：拿别处的 offset 表来查时，先确认两边是同一套字母表',
+        ],
+      }, null, 2)
     },
   }))
 
@@ -568,7 +637,12 @@ export function apply(ctx) {
       render: (_a, v) => [{ type: 'text', text: v }],
     },
     async execute(args) {
-      return [
+      // 证据形状（规划 §5.1）：清单型工具 —— 清单本身就是它给出的东西（进 dump）。
+      return JSON.stringify({
+        tool: 'pwn_rop_hint',
+        target: args.binary,
+        operation: 'produce a ret2libc/ROP planning checklist (does not read the binary at all)',
+        observed: { binary: args.binary, goal: args.goal ?? 'shell', dump: [
         `# ROP plan for ${args.binary}`,
         `goal: ${args.goal ?? 'shell'}`,
         '1. confirm overflow offset via cyclic + crash RIP',
@@ -577,7 +651,15 @@ export function apply(ctx) {
         '4. second payload: pop rdi; ret → binsh → system (align stack with extra ret)',
         '5. prefer local lab targets only; never against unauthorized hosts',
         'note: this tool is a planning checklist only — it does not inspect the binary; pair it with pwn_checksec, rev_imports and rev_gadget_scan',
-      ].join('\n')
+        ].join('\n') },
+        confidence: 'inferred',
+        limitations: [
+          '**这是清单，不是结论**：本工具**根本不看文件** —— 不读 ELF、不找 gadget、不算偏移',
+          '所以它的前提（PIE/NX/canary/RELRO、溢出偏移、libc 版本）必须先由 pwn_checksec / rev_* / bin_* 验过；没验过就不能按它动手',
+          '步骤顺序是**一种**常见打法（ret2libc），不是唯一解：目标有 seccomp、特殊 libc 或栈保护时整条路可能不成立',
+          '只用在与授权范围一致的目标上（本地 lab 优先）',
+        ],
+      }, null, 2)
     },
   }))
 }

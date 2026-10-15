@@ -30,7 +30,26 @@ function shq(value) {
  * `TypeError: shell.run is not a function` on every call, in every engine
  * version. `scripts/verify-security-tools.mjs` now fails loudly if a call site
  * names a seam method the executor does not have.
+ *
+ * **失败面的口径是"大声"**（Q5）：这一包全是**活读数**，"没量到"绝不能读成"没有" ——
+ *   · 缺 `ps` / `lsof` / `netstat` / `ping` 时各自走已登记的路径：能换方法的换（`lsof` 不通换
+ *     `netstat`，并在结果里说清"netstat 的表更粗、没有进程名/PID"），换不了就 `requireOk` 抛错；
+ *   · "成功却没输出"是一等状态：`diag_procs` 会明说"ps 成功却没有任何输出 ⇒ 这张表是被读空的"；
+ *   · `diag_net_watch` 读到**半个样本**就跳过并**报出跳过数**（静默丢数据比丢数据更糟），
+ *     停止是**异步**的（写完信号文件就返回），这些都在各支的 `limitations` 里。
  */
+/**
+ * 路径参数规范化：以 `-` 开头的路径加 `./` 前缀（2026-10-14）。
+ *
+ * 与六个安全包里的同名助手同源（§5.4.1/§5.4.3）：不插 `--`（本机 objdump/base64/otool 不支持），
+ * 而是把它变成一个普通相对路径。这里用于 `diag_net_watch` 的 `dir` —— 同一族的**无伤**版本
+ * （裸 `-o/tmp/x` 进 `mkdir` 只会响亮报错），本笔是**一致性收尾**，不是安全修复。
+ */
+function safePath(value) {
+  const text = String(value ?? '')
+  return text.startsWith('-') ? './' + text : text
+}
+
 async function runCmd(shell, argv, exec, opts = {}) {
   const result = await (await shell.execute(shell.resolve({
     command: argv.map(shq).join(' '),
@@ -60,9 +79,19 @@ async function runCmd(shell, argv, exec, opts = {}) {
  */
 function requireOk(run, what) {
   if (run.exitCode === 0) return run.stdout
-  const detail = run.stderr.trim().split('\n').map(line => line.trim()).filter(Boolean).slice(0, 3).join(' | ')
-  const missing = run.exitCode === 127 || /command not found/iu.test(run.stderr) ? ' — the command is not installed on this host' : ''
-  const error = new Error(`${what} failed (exit ${run.exitCode})${missing}: ${run.command}${detail === '' ? '' : `\n${detail}`}`)
+  // 沙箱拒绝的形状是**结果正文里的标记**（`[sandbox: file access denied under <mode> mode]`，
+  // 抄自 @deepseek-ai/dsh-sandbox/index.js:65）—— 它落在 stdout 上；只读 stderr 就会把它丢掉，
+  // 于是模型读到的是「命令失败」，而不是「你没有被授权」。所以标记必须原样带进错误文案。
+  const sandboxMark = /^\[sandbox: .*\]$/mu.exec(run.stdout)
+  const detail = [sandboxMark?.[0], ...run.stderr.trim().split('\n').map(line => line.trim()).filter(Boolean)].slice(0, 3).join(' | ')
+  const notInstalled = run.exitCode === 127 || /command not found/iu.test(run.stderr)
+  const missing = notInstalled ? ' — the command is not installed on this host' : ''
+  // 失败文案要对**读它的模型**可行动（Q6）：不是裸 stderr，但也不许臆断原因 ——
+  // 只给「这条 exit 属于哪一类」与「下一步可以试什么」，具体判断仍留给读的人。
+  const next = notInstalled
+    ? 'next: this host lacks that command — look for a built-in fallback in this package, or read the file another way'
+    : 'next: check the path, and that the file is what this tool expects (bin_file shows what it is); the line above is the command own reason'
+  const error = new Error(`${what} failed (exit ${run.exitCode})${missing}: ${run.command}${detail === '' ? '' : `\n${detail}\n${next}`}`)
   error.name = 'CommandError'
   throw error
 }
@@ -382,8 +411,7 @@ export function apply(ctx) {
     async execute(_args, exec) {
       exec.signal.throwIfAborted()
       const mem = os.totalmem()
-      return JSON.stringify(
-        {
+      const hostSnapshot = {
           hostname: os.hostname(),
           platform: os.platform(),
           release: os.release(),
@@ -394,10 +422,18 @@ export function apply(ctx) {
           freeMemGB: +(os.freemem() / 1024 ** 3).toFixed(2),
           loadavg: os.loadavg().map((n) => +n.toFixed(2)),
           uptimeHours: +(os.uptime() / 3600).toFixed(2),
-        },
-        null,
-        2,
-      )
+      }
+      return JSON.stringify({
+        tool: 'diag_host',
+        target: 'this host',
+        operation: 'read local host identity, CPU and memory counters (read-only, no probing)',
+        observed: hostSnapshot,
+        confidence: 'observed',
+        limitations: [
+          '只看得到本机：没有对端/邻居的信息（对端要用 recon_* 或 diag_net_rtt 单独量）',
+          '负载与内存是瞬时读数：不说明趋势，也不说明是不是刚刚才变（趋势要用 diag_net_watch 那类记录仪）',
+        ],
+      }, null, 2)
     },
   }))
 
@@ -412,11 +448,24 @@ export function apply(ctx) {
       render: (_a, v) => [{ type: 'text', text: v }],
     },
     async execute(args, exec) {
+      // 证据形状（规划 §5.1）：两支都产出信封。
+      const envelope = (observed, limitations) => JSON.stringify({
+        tool: 'diag_procs',
+        target: 'this host',
+        operation: 'take one ps aux snapshot and return the top rows by %CPU',
+        observed,
+        confidence: 'observed',
+        limitations,
+      }, null, 2)
       const limit = Math.max(1, Math.min(50, Number(args.limit) || 15))
       const stdout = requireOk(await runCmd(shell, ['ps', 'aux'], exec, { stdoutMaxBytes: 1048576 }), 'ps aux')
       const lines = stdout.split('\n').filter(Boolean)
       const [header, ...rest] = lines
-      if (header === undefined) return 'ps aux produced no output (the command succeeded, which is suspicious)'
+      if (header === undefined) {
+        return envelope({ method: 'ps', rows: 0, dump: 'ps aux produced no output (the command succeeded, which is suspicious)' }, [
+          'ps 成功却没有任何输出 ⇒ 这张表是被读空的：**不能**读成「本机没有进程」',
+        ])
+      }
       const body = rest
         .sort((a, b) => {
           const pa = parseFloat(a.split(/\s+/)[2] || '0')
@@ -424,7 +473,10 @@ export function apply(ctx) {
           return pb - pa
         })
         .slice(0, limit)
-      return [header, ...body].join('\n')
+      return envelope({ method: 'ps', limit, rows: body.length, dump: [header, ...body].join('\n') }, [
+        'ps aux 的表格原样返回，本工具只做两件事：按第 3 列（%CPU）降序、取前 limit 行',
+        '这是**一次快照**：不说明进程的历史、持续时间或趋势（要趋势得自己隔一段时间再取一次）',
+      ])
     },
   }))
 
@@ -437,12 +489,33 @@ export function apply(ctx) {
       render: (_a, v) => [{ type: 'text', text: v }],
     },
     async execute(_args, exec) {
+      // 证据形状（规划 §5.1）：三支都产出信封。两条方法（lsof / netstat）与"什么都没读到"都要说清。
+      const envelope = (observed, limitations) => JSON.stringify({
+        tool: 'diag_net',
+        target: 'this host',
+        operation: 'snapshot TCP listening sockets (read-only, no probing)',
+        observed,
+        confidence: 'observed',
+        limitations,
+      }, null, 2)
       const lsof = await runCmd(shell, ['lsof', '-nP', '-iTCP', '-sTCP:LISTEN'], exec)
-      if (lsof.exitCode === 0) return lsof.stdout.slice(0, 8000)
+      if (lsof.exitCode === 0) {
+        return envelope({ method: 'lsof', dump: lsof.stdout.slice(0, 8000), truncated: lsof.stdout.length > 8000 }, [
+          'lsof 的输出原样返回（截断到 8000 字符；truncated=true 表示后面还有没给出来的内容）',
+          '这是**一次快照**：不说明套接字的历史，也不说明谁在连它',
+        ])
+      }
       const listeners = requireOk(await runCmd(shell, ['netstat', '-an'], exec), 'netstat -an')
         .split('\n').filter((l) => l.includes('LISTEN')).slice(0, 80)
-      if (listeners.length > 0) return listeners.join('\n')
-      return 'no listening TCP sockets (lsof failed and netstat reported no LISTEN lines)'
+      if (listeners.length > 0) {
+        return envelope({ method: 'netstat', dump: listeners.join('\n'), truncated: true }, [
+          'lsof 没跑通，这份读数是 netstat -an 里含 LISTEN 的行（只取前 80 行）',
+          'netstat 的表格比 lsof 粗：没有进程名/PID，只说「有东西在这个地址上听」',
+        ])
+      }
+      return envelope({ method: null, dump: '' }, [
+        'lsof 与 netstat 都没有给出 LISTEN 行 —— 这句话的前提是**两条命令都真的跑过了**；否则「没量到」会被读成「没有」',
+      ])
     },
   }))
 
@@ -538,7 +611,7 @@ export function apply(ctx) {
           : delta > 30
             ? `外网比网关多 ${delta.toFixed(1)}ms：这段差值来自光猫/路由器的排队与路径，跟 Wi-Fi 空口无关。`
             : `外网与网关只差 ${delta.toFixed(1)}ms，路径干净。此时若仍感到卡，更可能在空口 —— 用 diag_wifi_link 看协商速率与抖动。`
-      return JSON.stringify({
+      const snapshot = {
         gateway: { target: gateway, ...gw, line: pingLine(`网关 ${gateway}`, gw) },
         wan: { target: wanTarget, ...wan, line: pingLine(`外网 ${wanTarget}`, wan) },
         deltaMs: delta,
@@ -546,6 +619,20 @@ export function apply(ctx) {
         jitterNote: gw.stddevMs !== null && gw.stddevMs > 2
           ? `网关抖动 ${gw.stddevMs}ms 偏大：空口在被抢，看 diag_wifi_channels 里有没有同频邻居。`
           : null,
+      }
+      // 证据形状（规划 §5.1）：信封 JSON —— 一次 RTT 采样（网关 + 外网）。
+      // limitations 必须说清"这几个数字各自是什么、以及它们看不见什么"。
+      return JSON.stringify({
+        tool: 'diag_net_rtt',
+        target: gateway + ' (gateway) + ' + wanTarget + ' (wan)',
+        operation: 'send ICMP echoes to both targets and report min/avg/max, loss and jitter',
+        observed: snapshot,
+        confidence: 'observed',
+        limitations: [
+          '回环 / 网关 / 外网是三个不同的东西：别把回环的 0.1ms 当成\u201c网好\u201d',
+          'ICMP 会被中间设备限速或直接丢弃 ⇒ 丢包不等于链路断（要用 TCP 层再证一次）',
+          '一次采样的 min/avg/max 不说明抖动趋势 —— 要趋势得用 diag_net_watch 那类记录仪',
+        ],
       }, null, 2)
     },
   }))
@@ -587,7 +674,7 @@ export function apply(ctx) {
       }
       const aggregateBps = measured.reduce((sum, sample) => sum + sample.bps, 0)
       const totalBytes = samples.reduce((sum, sample) => sum + sample.bytes, 0)
-      return JSON.stringify({
+      const snapshot = {
         url,
         streams,
         seconds,
@@ -597,6 +684,20 @@ export function apply(ctx) {
         totalBytes,
         totalMiB: Number((totalBytes / 1048576).toFixed(1)),
         note: '默认按「跑满」配置（8 流 × 10 秒）；totalBytes 是本次实际消耗的流量。测出来的是「无线链路 + 外网」合起来的上限，不是链路理论值。',
+      }
+      // 证据形状（规划 §5.1）：信封 JSON。这个工具是七个里**唯一会产生真实流量**的，
+      // 所以 limitations 要讲清"这次花了你多少流量"与"速率读数看不见什么"。
+      return JSON.stringify({
+        tool: 'diag_net_throughput',
+        target: url,
+        operation: 'run ' + streams + ' parallel curl streams for up to ' + seconds + 's each and report throughput',
+        observed: snapshot,
+        confidence: 'observed',
+        limitations: [
+          '这是一次**真实流量**测量：observed.totalBytes 就是本次消耗的字节数（默认档位是 8 流 × 10 秒）',
+          '读的是链路**容量**：不说明时延、丢包或抖动 —— 那些用 diag_net_rtt / diag_net_watch 量',
+          '聚合速率受对端与服务端共同限制：它只证明"这条路径此刻能跑到多少"，不区分是谁的限制',
+        ],
       }, null, 2)
     },
   }))
@@ -616,11 +717,21 @@ export function apply(ctx) {
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(args, exec) {
-      const paths = watchPaths(args.dir)
+      // undefined 必须保持 undefined（否则默认目录就没了）：只规范化"给了且以 - 开头"的那种。
+      const paths = watchPaths(args.dir === undefined ? undefined : safePath(args.dir))
       const action = String(args.action ?? 'status').trim() === '' ? 'status' : String(args.action).trim()
       const gateway = requireHost(args.gateway, '192.168.1.1')
       const wan = requireHost(args.wan, '223.5.5.5')
       const count = clampInteger(args.count, 8, 4, 30)
+      // 证据形状（规划 §5.1）：逐支迁移 —— 本轮只把 status 支包上（没有消费方读它的裸文本）。
+      const envelope = (observed, limitations) => JSON.stringify({
+        tool: 'diag_net_watch',
+        target: paths.dir,
+        operation: 'long-running link/RTT recorder: ' + action,
+        observed,
+        confidence: 'observed',
+        limitations,
+      }, null, 2)
 
       if (action === 'start') {
         const interval = clampInteger(args.interval, 10, 3, 600)
@@ -635,7 +746,7 @@ export function apply(ctx) {
           timeoutMs: 7 * 24 * 3600 * 1000,
           signal: exec.signal,
         }))
-        return [
+        return envelope({ method: 'start', log: paths.log, interval, linkEvery, count, gateway, wan, dump: [
           `记录仪已启动`,
           `日志：${paths.log}`,
           `间隔 ${interval}s；每 ${linkEvery} 次采样取一次链路；每次每目标 ${count} 个包`,
@@ -644,7 +755,10 @@ export function apply(ctx) {
           `卡住时立刻打标记：diag_net_watch action=mark message="电视卡了"`,
           `停止：diag_net_watch action=stop`,
           `回看：diag_net_watch action=report`,
-        ].join('\n')
+        ].join('\n') }, [
+          '这是**后台**记录仪：本工具返回的时候采样循环才刚开始 ⇒ 日志会一直长，随时用 action=report 回看', 
+          'observed 里带着它的节奏（间隔 / 每 N 次取链路 / 每目标包数）—— 以后看报告时能对上它是按什么节奏记的', 
+        ])
       }
 
       if (action === 'stop') {
@@ -655,7 +769,10 @@ export function apply(ctx) {
           { timeoutMs: 20000 },
         )
         requireOk(run, '写停止文件')
-        return `停止信号已写入 ${paths.stop}\n采样循环会在当前这一轮 sleep 结束后退出，最多等一个采样间隔。用 action=status 确认。`
+        return envelope({ method: 'stop', stopFile: paths.stop, dump: `停止信号已写入 ${paths.stop}\n采样循环会在当前这一轮 sleep 结束后退出，最多等一个采样间隔。用 action=status 确认。` }, [
+          '这是**异步**停止：写完信号文件就返回了，采样循环要等当前这一轮 sleep 结束才退出',
+          '要确认它真的停了，用 action=status 看最后写入时间，或再 action=report 比样本数',
+        ])
       }
 
       if (action === 'sample') {
@@ -666,7 +783,10 @@ export function apply(ctx) {
           { timeoutMs: 30000 },
         )
         requireOk(run, '采样')
-        return `已采样并追加到 ${paths.log}\n用 action=report 看，或 action=mark 标一下刚才发生了什么。`
+        return envelope({ method: 'sample', log: paths.log, dump: `已采样并追加到 ${paths.log}\n用 action=report 看，或 action=mark 标一下刚才发生了什么。` }, [
+          '这一次采样写进了日志；它的**内容**要看 action=report（这里只报"写成功了"）',
+          '样本是往日志尾部**追加**的：这个动作不会覆盖历史，也不会改变记录仪是否在跑',
+        ])
       }
 
       if (action === 'mark') {
@@ -683,7 +803,10 @@ export function apply(ctx) {
           { timeoutMs: 20000 },
         )
         requireOk(run, '写标记')
-        return `已标记「${message}」@ ${stampOf(Math.floor(Date.now() / 1000))}\n日志：${paths.log}`
+        return envelope({ method: 'mark', log: paths.log, dump: `已标记「${message}」@ ${stampOf(Math.floor(Date.now() / 1000))}\n日志：${paths.log}` }, [
+          '标记是你打的**锚点**，它本身不是测量 —— report 会把它对齐到最近的样本（误差 ≤ 一个采样间隔）',
+          '标记只往日志里追加一行，不改变采样节奏，也不影响记录仪是否在跑',
+        ])
       }
 
       if (action === 'report') {
@@ -695,13 +818,27 @@ export function apply(ctx) {
           { timeoutMs: 30000, stdoutMaxBytes: 8388608 },
         )
         if (run.stdout.trim() === '') {
-          return `还没有样本（${paths.log} 不存在或为空）。先 action=start 起记录仪，或 action=sample 取一个。`
+          return envelope({ method: 'report', samples: 0, dump: '', log: paths.log }, [
+            '日志不存在或为空 ⇒ 这是「还没有样本」，不是「网络没问题」',
+            `先 action=start 起记录仪，或 action=sample 取一个（看的是 ${paths.log}）`,
+          ])
         }
         const { rows, marks, skipped } = readWatch(run.stdout)
         if (rows.length === 0) {
-          return skipped > 0
-            ? `日志里有 ${skipped} 个样本还没写完（记录仪正在写），暂时没有完整的样本可看。稍后再试。`
-            : `日志里没解析出完整样本（${paths.log}）：文件可能刚被截断。`
+          return envelope({
+            method: 'report',
+            samples: 0,
+            skipped,
+            log: paths.log,
+            dump: skipped > 0
+              ? `日志里有 ${skipped} 个样本还没写完（记录仪正在写），暂时没有完整的样本可看。稍后再试。`
+              : `日志里没解析出完整样本（${paths.log}）：文件可能刚被截断。`,
+          }, [
+            '一个完整样本都没有 ⇒ 这份报告里**没有任何测量**，不是「这一段时间网络正常」',
+            skipped > 0
+              ? '只有半截样本 —— 读到一半的记录会得出凭空的故障结论，所以它不算证据'
+              : '文件可能刚被截断，也可能记录仪根本没在跑 —— 这两种要分开查',
+          ])
         }
         const first = rows[0]
         const last = rows[rows.length - 1]
@@ -756,7 +893,13 @@ export function apply(ctx) {
             + ` 外网 ${nearest.wan.avgMs ?? '无回应'}ms（抖动 ${nearest.wan.stddevMs ?? '—'}ms）`
             + ` 链路 ${nearest.link.channel ?? '—'}/${nearest.link.widthMhz ?? '—'}MHz 协商 ${nearest.link.transmitRateMbps ?? '—'}Mbps`)
         }
-        return lines.join('\n')
+        // 报告文本原样进 observed.dump（消费方都是子串正则，不需要改读法）。
+        return envelope({ method: 'report', samples: rows.length, skipped, dump: lines.join('\n') }, [
+          '报告覆盖的是**日志里记着的那段时间** —— 记录仪没起着的时段，它什么都不知道',
+          skipped > 0
+            ? '有未写完的样本被跳过（数量见 observed.skipped）：那些时刻只有半个样本，不能当证据'
+            : '这次没有跳过未写完的样本；但"没跳过"只说明这次读的时候没有半截样本',
+        ])
       }
 
       // status（默认）：永远给出可读结论，绝不返回空字符串。
@@ -784,7 +927,13 @@ export function apply(ctx) {
         '  echo "还没有日志文件"',
         'fi',
       ].join('\n')], exec, { timeoutMs: 20000, stdoutMaxBytes: 262144 })
-      return run.stdout.trim() === '' ? '记录仪状态未知：状态命令没有输出。' : run.stdout.trim()
+      const statusText = run.stdout.trim()
+      // 「未知」与「没在跑」是两件事：状态命令没输出时不许说成没在跑。
+      return envelope({ method: 'status', dump: statusText, known: statusText !== '' }, [
+        statusText === ''
+          ? '状态命令没有输出 ⇒ 这是「未知」，不是「没在跑」'
+          : '这是记录仪自己报的状态，不是从日志推断的；它只说这一刻，不说明采样准不准',
+      ])
     },
   }))
 
