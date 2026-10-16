@@ -7,7 +7,9 @@
  *  · **知识层**：一个 bundled skill（`assets/client-blackbox/`），按需加载。agent 读到的是
  *    心智模型（三源一闸 S1/S2/S3/G）、六条判据 T1–T6、五阶段带 Gate 流程与可复用脚本模板。
  *    知识本身不产生副作用，所以不受授权闸门管。
- *  · **执行层**：七个工具，走宿主 `shell` 接缝。它只管**可观测性与判定**（起代理、判管道、
+ *  · **执行层**：十个工具，走宿主 `shell` 接缝（最近三件 `bx_cdp_targets` / `bx_cdp_scripts` /
+ *    `bx_cdp_coverage` 是**进程内通道**：CDP 调试端口上的 target 清单、已解析脚本清单、精确覆盖率 ——
+ *    线缆层看不见"进程里显示了什么、哪段 JS 改的它"，它们补这一半；只连回环、整件在授权门后）。它只管**可观测性与判定**（起代理、判管道、
  *    读抓包、比对前后），改写路径（请求/响应注入）必须显式授权。
  *
  * 三条纪律写死在实现里，因为每一条都对应一次实测事故：
@@ -433,6 +435,286 @@ function workspaceRoot(exec) {
  * 读一行文本，走接缝。用于**用户数据**（dump、规则文件）—— 这样沙箱拒绝会以
  * `SandboxError` 报出。允许 fs 的两处例外（自带资产 / 自身状态文件）见 §3.1。
  */
+// ── CDP（进程内通道）───────────────────────────────────────────────────────
+//
+// 为什么加在 blackbox 而不是新开一个包（裁决 2026-10-15）：线缆层（mitm 抓包）看得见
+// "谁跟谁说了什么"，看不见"进程里到底显示了什么、哪段 JS 改的它"；Electron / Chromium 内核
+// 宿主这两层都开着，所以 CDP 是同一个使命的另一条通道。
+//
+// 两条结构性纪律：
+//   · **只走回环**：URL 由端口拼出来，参数表里**没有 host** ⇒ 结构上不可能指向别的主机；
+//   · **端口只认参数**：状态文件里的 `port` 是 mitm **代理**端口，拿它当调试端口是类别错误。
+
+/** 一次列多少条 target（超出的报 omitted，不静默丢）。 */
+const CDP_TARGETS_SHOWN = 50
+
+/** CDP 调试端口：只认显式参数。 */
+function requireCdpPort(value) {
+  const port = Number(value)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    const error = new Error(
+      `CDP 端口必须是 1..65535 的整数（收到 ${JSON.stringify(value)}）。`
+      + '这一项**只认参数**：.fly-blackbox 状态里的 port 是 mitm 代理端口，不是调试端口。',
+    )
+    error.name = 'ArgumentError'
+    throw error
+  }
+  return port
+}
+
+/** 只走回环：URL 由端口拼出来（没有 host 参数，所以不可能指向别处）。 */
+function cdpListUrl(port) {
+  return `http://127.0.0.1:${port}/json/list`
+}
+
+/** 连不上时的**大声**文案：是什么 + 为什么只可能是这几种 + 下一步（怎么起目标）。 */
+function cdpUnreachableError(port, run) {
+  const detail = (run.stderr ?? '').trim().split('\n').filter(Boolean)[0] ?? ''
+  const error = new Error([
+    `连不上 CDP 调试端口 127.0.0.1:${port}：${detail === '' ? `curl 退出码 ${run.exitCode}` : detail}`,
+    '—— 这一项**只连回环**，所以只剩三种可能：那个进程没在监听这个端口 / 端口号给错了 / 目标没带调试开关起来。',
+    '怎么起一个带调试端口的目标（端口号自己换一个没人用的）：',
+    `  · Chromium 内核浏览器：open -a "Google Chrome" --args --remote-debugging-port=${port} --user-data-dir=/tmp/cdp-${port}`,
+    `  · Electron 应用：<App 可执行文件> --remote-debugging-port=${port}`,
+    '顺带一句：调试端口开着就等于把那个界面完全交出去（能读 DOM、也能改它），用完关掉那个实例。',
+  ].join('\n'))
+  error.name = 'CommandError'
+  return error
+}
+
+/** `/json/list` 的返回体：不是 JSON / 不是数组，都要说清"是那端口不对，不是没有 target"。 */
+function parseCdpTargets(text, port) {
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new Error(
+      `127.0.0.1:${port}/json/list 返回的不是 JSON —— 这**不是**"没有 target"，`
+      + `是那个端口上不是调试接口（${error.message}）。返回体头 120 字：${JSON.stringify(text.slice(0, 120))}`,
+    )
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `127.0.0.1:${port}/json/list 的返回不是数组（CDP 的约定是数组）—— 实际是 ${typeof parsed}：`
+      + '这**不是**"没有 target"，是那个端口上不是调试接口。',
+    )
+  }
+  return parsed.filter(item => item !== null && typeof item === 'object' && !Array.isArray(item))
+}
+
+/** 取一次 target 清单（走接缝的 curl，所以有审计、沙箱拒绝会照常浮出）。 */
+async function fetchCdpTargets(shell, exec, port) {
+  const run = await runCmd(shell, ['curl', '-sS', '-m', '8', cdpListUrl(port)], exec, { timeoutMs: 15_000 })
+  if (run.exitCode !== 0) return { ok: false, run }
+  return { ok: true, targets: parseCdpTargets(run.stdout, port) }
+}
+
+/** 从清单里挑一个**可附加**的 target：给了 id 就按 id，否则优先第一个 page。 */
+function pickCdpTarget(targets, wanted, port) {
+  const attachable = targets.filter(item => typeof item.webSocketDebuggerUrl === 'string' && item.webSocketDebuggerUrl !== '')
+  const wantedId = wanted === undefined || wanted === null ? '' : String(wanted).trim()
+  if (wantedId !== '') {
+    const found = attachable.find(item => item.id === wantedId)
+    if (found === undefined) {
+      throw new Error(`127.0.0.1:${port} 上没有 id=${wantedId} 的可附加 target（可附加的有：${attachable.map(item => `${item.id}(${item.type})`).join(', ') || '无'}）`)
+    }
+    return found
+  }
+  const page = attachable.find(item => item.type === 'page')
+  if (page !== undefined) return page
+  if (attachable.length > 0) return attachable[0]
+  throw new Error(`127.0.0.1:${port} 上没有可附加的 target（清单里 ${targets.length} 条，但都没有 webSocketDebuggerUrl）—— 这不等于"这个进程没有页面"，只是没有可附加的调试目标。`)
+}
+
+/** 采样窗口：夹在合理区间里（给 0 或负值等于"什么都不收"，那就不是测量了）。 */
+function clampWindow(value, fallback, lo, hi) {
+  if (value === undefined || value === null) return fallback
+  const window = Number(value)
+  if (!Number.isFinite(window)) return fallback
+  return Math.min(hi, Math.max(lo, Math.round(window)))
+}
+
+/**
+ * 把一组 offset 区间**求并集**：V8 的函数区间会嵌套，直接相加会重复计数。
+ * （这是 bx_cdp_coverage 的口径；尺子反过来也专抓"直接相加"那种错。）
+ */
+function mergeRanges(ranges) {
+  const sorted = ranges.slice().sort((a, b) => a.startOffset - b.startOffset)
+  const merged = []
+  for (const range of sorted) {
+    const last = merged.at(-1)
+    if (last !== undefined && range.startOffset <= last.endOffset) {
+      last.endOffset = Math.max(last.endOffset, range.endOffset)
+      continue
+    }
+    merged.push({ startOffset: range.startOffset, endOffset: range.endOffset })
+  }
+  return merged
+}
+
+/** `Profiler.takePreciseCoverage` 的返回 → 逐脚本"跑过多少"（区间求并集后统计）。 */
+function summarizeCoverage(scripts) {
+  const rows = []
+  let usedTotal = 0
+  let sizeTotal = 0
+  for (const script of scripts) {
+    const functions = Array.isArray(script.functions) ? script.functions : []
+    const rangesOf = entry => (Array.isArray(entry.ranges) ? entry.ranges : [])
+    const executed = functions.flatMap(entry => rangesOf(entry)
+      .filter(range => (range.count ?? 0) > 0)
+      .map(range => ({ startOffset: range.startOffset, endOffset: range.endOffset })))
+    const ends = functions.flatMap(entry => rangesOf(entry).map(range => range.endOffset))
+    const size = ends.length === 0 ? 0 : Math.max(...ends)
+    const used = mergeRanges(executed).reduce((sum, range) => sum + (range.endOffset - range.startOffset), 0)
+    usedTotal += used
+    sizeTotal += size
+    rows.push({
+      scriptId: script.scriptId,
+      url: typeof script.url === 'string' && script.url !== '' ? script.url : '(inline/eval)',
+      functions: functions.length,
+      executedFunctions: functions.filter(entry => rangesOf(entry).some(range => (range.count ?? 0) > 0)).length,
+      usedBytes: used,
+      sizeBytes: size,
+    })
+  }
+  return { rows, usedTotal, sizeTotal }
+}
+
+/** 取 target → 挑 target → 连上去跑一段会话；连不上就给两条信号合起来的判词。 */
+async function cdpAttach(transport, shell, exec, { port, target, commands, finish, windowMs }) {
+  const fetched = await fetchCdpTargets(shell, exec, port)
+  if (!fetched.ok) throw cdpUnreachableError(port, fetched.run)
+  const picked = pickCdpTarget(fetched.targets, target, port)
+  try {
+    const session = await transport.session(picked.webSocketDebuggerUrl, { commands, finish, windowMs })
+    return { session, picked }
+  } catch (error) {
+    throw new Error(await cdpUnreachableDetail(shell, exec, port, error, { httpKnownOk: true }))
+  }
+}
+
+/** 真传输：Node 全局 WebSocket（22+，零依赖）。 */
+function realCdpTransport() {
+  return {
+    /**
+     * 连上去 → 发 commands → 收 windowMs 事件 → 发 finish → 等它们的响应 → 关掉。
+     *
+     * 实测的三种失败**在客户端长得一模一样**（error.message 为空、close code 1006、没有 reason），
+     * 所以这里只如实记下 closeCode/reason，**不猜**是哪一种失败 —— 分辨交给调用方（它会另跑一次
+     * /json/list 探针）。
+     */
+    session(wsUrl, { commands = [], finish = [], windowMs = 1200, finishTimeoutMs = 3000 } = {}) {
+      return new Promise((resolve, reject) => {
+        let ws
+        try {
+          ws = new WebSocket(wsUrl)
+        } catch (error) {
+          reject(error)
+          return
+        }
+        const events = []
+        const results = {}
+        const wanted = new Map()
+        let opened = false
+        let settled = false
+        let windowTimer
+        let finishTimer
+        const settle = (payload, error) => {
+          if (settled) return
+          settled = true
+          clearTimeout(windowTimer)
+          clearTimeout(finishTimer)
+          try { ws.close() } catch { /* 关不掉就算了，下面已经把结果交出去了 */ }
+          if (error !== undefined) reject(error)
+          else resolve(payload)
+        }
+        const send = (spec, id) => {
+          wanted.set(id, spec.key ?? spec.method)
+          ws.send(JSON.stringify({ id, method: spec.method, ...spec.params === undefined ? {} : { params: spec.params } }))
+        }
+        ws.onopen = () => {
+          opened = true
+          let id = 0
+          for (const spec of commands) { id += 1; send(spec, id) }
+          windowTimer = setTimeout(() => {
+            let pending = 0
+            for (const spec of finish) { id += 1; pending += 1; send(spec, id) }
+            if (pending === 0) { settle({ events, results, closedEarly: false, closeCode: null, closeReason: '' }); return }
+            finishTimer = setTimeout(() => settle({ events, results, closedEarly: false, closeCode: null, closeReason: '' }), finishTimeoutMs)
+          }, windowMs)
+        }
+        ws.onmessage = (message) => {
+          let parsed
+          try {
+            parsed = JSON.parse(String(message.data))
+          } catch {
+            return // 不认识的帧就当没看见（不假装解析过）
+          }
+          if (typeof parsed.method === 'string') {
+            events.push(parsed)
+            return
+          }
+          if (typeof parsed.id === 'number' && wanted.has(parsed.id)) {
+            results[wanted.get(parsed.id)] = parsed.error === undefined ? { result: parsed.result } : { error: parsed.error }
+            if (finishTimer !== undefined && [...wanted.values()].every(key => Object.hasOwn(results, key))) {
+              settle({ events, results, closedEarly: false, closeCode: null, closeReason: '' })
+            }
+          }
+        }
+        ws.onerror = () => {
+          // 实测：message 是空串 ⇒ 这里什么都不记，别编原因（closeCode 由 onclose 给）
+        }
+        ws.onclose = (event) => {
+          const closeCode = event.code
+          const closeReason = event.reason ?? ''
+          if (opened) {
+            settle({ events, results, closedEarly: true, closeCode, closeReason })
+            return
+          }
+          const error = new Error(`WebSocket 没连上 ${wsUrl}（close code ${closeCode}${closeReason === '' ? '' : ` · ${closeReason}`}）`)
+          error.name = 'CdpOpenError'
+          error.closeCode = closeCode
+          error.closeReason = closeReason
+          settle(undefined, error)
+        }
+      })
+    },
+  }
+}
+
+/**
+ * 连不上时把两种信号合起来判：WebSocket 侧（只有 closeCode）＋ /json/list 探针（HTTP 侧通不通）。
+ * **不猜**是哪一种 —— 实测三种失败在客户端同形（见 realCdpTransport 的注释）。
+ */
+async function cdpUnreachableDetail(shell, exec, port, error, { httpKnownOk = false } = {}) {
+  // 注意别拿"假的探针结果"当哨兵：一开始这里用 `{ exitCode: 1 }` 表示"HTTP 侧已知是活的"，
+  // 于是它和自己的失败分支**同形**，被读成"两条路都不通"（测试当场抓到）。现在用**独立布尔**。
+  const probe = httpKnownOk
+    ? undefined
+    : await runCmd(shell, ['curl', '-sS', '-m', '8', cdpListUrl(port)], exec, { timeoutMs: 15_000 })
+  const httpOk = httpKnownOk || probe.exitCode === 0
+  const wsShape = `WebSocket 侧：close code ${error?.closeCode ?? '(无)'}${(error?.closeReason ?? '') === '' ? '、reason 空' : `、reason ${error.closeReason}`}`
+  if (!httpOk) {
+    const detail = (probe.stderr ?? '').trim().split('\n').filter(Boolean)[0] ?? ''
+    return [
+      `连不上 CDP 调试端口 127.0.0.1:${port} —— HTTP 探针（/json/list）也失败：${detail === '' ? `curl 退出码 ${probe.exitCode}` : detail}`,
+      `${wsShape}。两条路都不通 ⇒ 最可能是那个进程没在监听这个端口。`,
+      '怎么起一个带调试端口的目标（端口号自己换一个没人用的）：',
+      `  · Chromium 内核浏览器：open -a "Google Chrome" --args --remote-debugging-port=${port} --user-data-dir=/tmp/cdp-${port}`,
+      `  · Electron 应用：<App 可执行文件> --remote-debugging-port=${port}`,
+    ].join('\n')
+  }
+  return [
+    `127.0.0.1:${port} 的 HTTP 侧是**活的**（/json/list 正常返回），但 WebSocket 握手没成 —— ${wsShape}`,
+    '（实测：Node 自带的 WebSocket 把"没人听""握手被拒""握上就断"报成**同一个形状** —— error.message 为空、close 1006；'
+      + '所以这里不猜是哪一种，只给两条分辨路。）',
+    '常见原因：Chrome 会拒绝 Host 头不是 localhost/IP 的握手；那个调试端口已被另一个工具占着（同一时间只允许一个客户端）；目标刚退出。',
+    '另外：如果你要的是"看页面里有什么、跑了哪些代码"，用同样在这个包里的 bx_cdp_targets 先看一眼清单是否还在。',
+  ].join('\n')
+}
+
+
+
 async function readTextFileVia(shell, exec, path, what, opts = {}) {
   const run = await runCmd(shell, ['base64', '-i', path], exec, { stdoutMaxBytes: 64 * 1024 * 1024 })
   if (missingTool(run)) throw new Error(`${what} 读不到：${path} —— 本机没有 base64（不应发生）`)
@@ -1191,6 +1473,11 @@ const GATE_TABLE = {
   bx_har: { actionless: true },
   // 没有 action 参数，只读两份 JSON。
   bx_diff: { actionless: true },
+  // 进程内通道：**整件受控**（照 bx_doctor 的先例）—— 附加调试接口会读走那个进程的实时状态，
+  // 后续的 Debugger/Profiler 还会在目标里打开仪表，属于"主动探测"那一档。
+  bx_cdp_targets: { readOnly: [] },
+  bx_cdp_scripts: { readOnly: [] },
+  bx_cdp_coverage: { readOnly: [] },
 }
 
 function gateReason(tool, action) {
@@ -1893,6 +2180,185 @@ export function apply(ctx) {
       }
       if (lines.length === 0) return '无差异（两份 JSON 在这些字段上逐值相同）'
       return [`${lines.length} 处差异：`, ...lines.map(line => `  ${line}`)].join('\n')
+    },
+  }))
+  // 传输是可注入的（`ctx.flyCdpTransport`）—— 桩就钉在这里：真接缝是 Node 全局 WebSocket，
+  // 而实测它把"没人听 / 握手被拒 / 握上就断"报成**同一个形状**，所以桩必须复刻那个形状。
+  const cdpTransport = () => (typeof ctx.flyCdpTransport?.session === 'function' ? ctx.flyCdpTransport : realCdpTransport())
+
+  // ── bx_cdp_targets（进程内通道第一件）───────────────────────
+  ctx.tools.register(defineTool({
+    name: 'bx_cdp_targets',
+    description: 'List debuggable targets (pages/workers/iframes) in a Chromium/Electron process started with --remote-debugging-port, via GET 127.0.0.1:<port>/json/list. Loopback only; needs FLY_ALLOW_INTERCEPT=1.',
+    parameters: {
+      port: { type: 'number', required: true, description: 'CDP debug port on 127.0.0.1, e.g. 9222' },
+    },
+    output: stringOutput,
+    async execute(args, exec) {
+      const port = requireCdpPort(args.port)
+      const run = await runCmd(shell, ['curl', '-sS', '-m', '8', cdpListUrl(port)], exec, { timeoutMs: 15_000 })
+      if (run.exitCode !== 0) throw cdpUnreachableError(port, run)
+      const targets = parseCdpTargets(run.stdout, port)
+      const shown = targets.slice(0, CDP_TARGETS_SHOWN)
+      return JSON.stringify({
+        tool: 'bx_cdp_targets',
+        target: `127.0.0.1:${port}`,
+        operation: `GET ${cdpListUrl(port)}（只走回环；端口只认参数）`,
+        observed: {
+          count: targets.length,
+          shown: shown.length,
+          omitted: targets.length - shown.length,
+          targets: shown.map(item => ({
+            id: item.id,
+            type: item.type,
+            title: item.title,
+            url: item.url,
+            attachable: typeof item.webSocketDebuggerUrl === 'string' && item.webSocketDebuggerUrl !== '',
+          })),
+        },
+        confidence: 'observed',
+        limitations: [
+          '这是**某一刻**的清单：target 会随页面开关、进程进退而变（attach 之后还会变）',
+          '只列**开了调试端口的那一个进程** —— 本机别的 Electron / 浏览器没开端口就完全看不见，'
+            + '这**不是**"本机没有这类应用"',
+          '只走回环（参数表里没有 host），所以它**不能**用来连远端设备 —— 那是另一件事',
+          '`webSocketDebuggerUrl`（真正的控制通道）**故意不打印**，只给 attachable 真假；'
+            + '拿到它就能完全接管那个页面，需要附加上去的动作在后续工具里、同样在这道门后面',
+          '`/json/list` 的字段随 Chromium 版本变（本工具只挑 id/type/title/url 四列 + attachable），'
+            + '少一列就是少一列，不当作失败',
+        ],
+      }, null, 2)
+    },
+  }))
+  // ── bx_cdp_scripts（进程内通道第二件）───────────────────────
+  ctx.tools.register(defineTool({
+    name: 'bx_cdp_scripts',
+    description: 'Attach to a CDP target on a loopback debug port and inventory its parsed scripts (Debugger.enable + Debugger.scriptParsed over a short window). Replays already-parsed scripts; source text is NOT returned. Needs FLY_ALLOW_INTERCEPT=1.',
+    parameters: {
+      port: { type: 'number', required: true, description: 'CDP debug port on 127.0.0.1, e.g. 9222' },
+      target: { type: 'string', description: 'target id from bx_cdp_targets; omit = first page target' },
+      windowMs: { type: 'number', description: 'how long to collect scriptParsed (default 1200, clamped 200..5000)' },
+    },
+    output: stringOutput,
+    async execute(args, exec) {
+      const port = requireCdpPort(args.port)
+      const windowMs = clampWindow(args.windowMs, 1200, 200, 5000)
+      const { session, picked } = await cdpAttach(cdpTransport(), shell, exec, {
+        port, target: args.target, windowMs, commands: [{ method: 'Debugger.enable' }],
+      })
+      const enable = session.results['Debugger.enable']
+      if (enable?.error !== undefined) {
+        throw new Error(`Debugger.enable 被目标拒绝（${enable.error.code ?? '?'} ${enable.error.message ?? ''}）—— 这个 target 不允许附加调试域，换一个 target 或换一个实例。`)
+      }
+      const scripts = session.events.filter(event => event.method === 'Debugger.scriptParsed').map(event => event.params ?? {})
+      const shown = scripts.slice(0, CDP_TARGETS_SHOWN)
+      return JSON.stringify({
+        tool: 'bx_cdp_scripts',
+        target: `127.0.0.1:${port} · ${picked.id}(${picked.type})`,
+        operation: `WebSocket 附加 → Debugger.enable → 收 ${windowMs}ms 的 Debugger.scriptParsed`,
+        observed: {
+          count: scripts.length,
+          shown: shown.length,
+          omitted: scripts.length - shown.length,
+          closedEarly: session.closedEarly,
+          closeCode: session.closeCode,
+          scripts: shown.map(item => ({
+            scriptId: item.scriptId,
+            url: typeof item.url === 'string' && item.url !== '' ? item.url : '(inline/eval)',
+            length: item.length,
+            isModule: item.isModule,
+            sourceMap: typeof item.sourceMapURL === 'string' && item.sourceMapURL !== '',
+            hasSourceURL: item.hasSourceURL,
+          })),
+        },
+        confidence: 'observed',
+        limitations: [
+          '这是**已经解析过**的脚本清单：`Debugger.enable` 会**回放**已解析的（实测挂上去立刻收到 7 条），'
+            + '它不是"将要解析什么"的预测',
+          '看不见**还没解析的懒加载代码**（窗口内没加载就不出现）、**已被 GC 的脚本**、以及**别的 target**'
+            + '（worker / iframe 在清单里是独立条目，要各自附加）',
+          '`url` 显示 `(inline/eval)` = 那段脚本没有 URL（内联或 eval）；`length` 是**源文本字符数**，不是字节数',
+          '**不返回源码**（要源码得再发 `Debugger.getScriptSource`，那是另一件事、另一个工具）',
+          `只收了一个窗口（${windowMs}ms），窗口一结束就**断开连接** —— CDP 的域随连接走，断开即释放，目标上不留仪表`,
+          session.closedEarly
+            ? `⚠️ 连接在窗口内断了（close code ${session.closeCode}）：上面这份是**窗口内收到的部分**，不是完整清单`
+            : '窗口内连接保持正常（没有提前断开）',
+        ],
+      }, null, 2)
+    },
+  }))
+
+  // ── bx_cdp_coverage（进程内通道第三件）───────────────────────
+  ctx.tools.register(defineTool({
+    name: 'bx_cdp_coverage',
+    description: 'Attach to a CDP target on a loopback debug port, measure precise JS coverage (Profiler.startPreciseCoverage + takePreciseCoverage) over a short window, and report executed-byte ratios per script. Fails loudly when the snapshot cannot be taken. Needs FLY_ALLOW_INTERCEPT=1.',
+    parameters: {
+      port: { type: 'number', required: true, description: 'CDP debug port on 127.0.0.1, e.g. 9222' },
+      target: { type: 'string', description: 'target id from bx_cdp_targets; omit = first page target' },
+      windowMs: { type: 'number', description: 'sampling window before the snapshot (default 1500, clamped 300..10000)' },
+    },
+    output: stringOutput,
+    async execute(args, exec) {
+      const port = requireCdpPort(args.port)
+      const windowMs = clampWindow(args.windowMs, 1500, 300, 10000)
+      const { session, picked } = await cdpAttach(cdpTransport(), shell, exec, {
+        port,
+        target: args.target,
+        windowMs,
+        commands: [
+          { method: 'Profiler.enable' },
+          { method: 'Profiler.startPreciseCoverage', params: { callCount: true, detailed: false }, key: 'start' },
+        ],
+        finish: [{ method: 'Profiler.takePreciseCoverage', key: 'take' }],
+      })
+      const took = session.results.take
+      if (took === undefined) {
+        throw new Error(session.closedEarly
+          ? `采样窗口里连接断了（close code ${session.closeCode}）—— **拿不到快照**，所以不给"部分覆盖率"：半份快照会让人把"没跑过"读成"跑过了"。`
+          : '发了 Profiler.takePreciseCoverage 但没等到响应 —— 目标可能卡住了（这一次没有覆盖率可报）。')
+      }
+      if (took.error !== undefined) {
+        throw new Error(`Profiler.takePreciseCoverage 被目标拒绝（${took.error.code ?? '?'} ${took.error.message ?? ''}）—— 目标可能不允许精确覆盖率采样。`)
+      }
+      const started = session.results.start
+      if (started?.error !== undefined) {
+        throw new Error(`Profiler.startPreciseCoverage 被目标拒绝（${started.error.code ?? '?'} ${started.error.message ?? ''}）—— 这一步没成功，后面的数就不是覆盖率。`)
+      }
+      const summary = summarizeCoverage(Array.isArray(took.result?.result) ? took.result.result : [])
+      const ranked = summary.rows.slice().sort((a, b) => b.sizeBytes - a.sizeBytes)
+      const shown = ranked.slice(0, CDP_TARGETS_SHOWN)
+      const percent = summary.sizeTotal === 0 ? null : Math.round(1000 * summary.usedTotal / summary.sizeTotal) / 10
+      return JSON.stringify({
+        tool: 'bx_cdp_coverage',
+        target: `127.0.0.1:${port} · ${picked.id}(${picked.type})`,
+        operation: `WebSocket 附加 → Profiler.enable + startPreciseCoverage → 采 ${windowMs}ms → takePreciseCoverage`,
+        observed: {
+          windowMs,
+          scripts: summary.rows.length,
+          shown: shown.length,
+          omitted: ranked.length - shown.length,
+          executedBytes: summary.usedTotal,
+          totalBytes: summary.sizeTotal,
+          executedPercent: percent,
+          rows: shown.map(row => ({
+            url: row.url,
+            functions: row.functions,
+            executedFunctions: row.executedFunctions,
+            executedBytes: row.usedBytes,
+            sizeBytes: row.sizeBytes,
+          })),
+        },
+        confidence: 'observed',
+        limitations: [
+          `只反映**这个 ${windowMs}ms 窗口内**跑过的代码 —— 再采一次会变；它不是"静态可达性"，`
+            + '更不能读成"这段代码永远不会跑"',
+          '**没加载的脚本根本不出现**（覆盖率只报看得见的脚本）—— 清单里没有 ≠ 这个应用没有那段代码',
+          '`detailed: false` ⇒ **函数粒度**（不是块粒度 / 不是逐语句）',
+          '区间**求了并集**再相加（V8 的函数区间会嵌套，直接相加会重复计数）—— 这是本工具的口径',
+          '采样期间目标带着 V8 的仪表跑，会略微变慢；窗口一结束就**断开连接**（域随连接走，断开即释放）',
+          '`执行比例` 是**字节口径**（已执行区间 / 脚本最大偏移），不是函数比例',
+        ],
+      }, null, 2)
     },
   }))
 }

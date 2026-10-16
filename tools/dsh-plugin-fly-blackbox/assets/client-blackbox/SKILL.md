@@ -146,6 +146,9 @@ tail -f .fly-blackbox/capture/all.log
 | `bx_ca` | CA 信任状态 + **要人跑的命令文本** + `security verify-cert` 事后证据 | 不受门控（永不提权） |
 | `bx_flows` | 离线读 dump：`hosts` / `list` / `show` / `grep`（版本闸 + 拒绝截断） | 不受门控（只读） |
 | `bx_diff` | 改前/改后字段级 diff，显式区分**缺失** / **假值** / **类型变化** | 不受门控（只读） |
+| `bx_cdp_targets` | **进程内通道第一件**：列 `127.0.0.1:<port>` 上可附加的 target（page/worker/iframe）。只走回环、端口只认参数、控制通道地址不打印；整件在 `FLY_ALLOW_INTERCEPT` 门后 |
+| `bx_cdp_scripts` | 附加上去收 `Debugger.scriptParsed`：**已解析**脚本清单（会回放已解析的；**不返回源码**；窗口一结束就断开） |
+| `bx_cdp_coverage` | 精确覆盖率：采一段窗口 → `takePreciseCoverage` → 逐脚本"已执行字节"（区间**求并集**；拿不到快照就**大声失败**，不给半份） |
 
 规则文件固定 `<workspace>/.fly-blackbox/rules.json`，由**你自己用文件工具写**，`bx_proxy start` 只读并校验；
 schema 与"显式 off、无静默默认值"的纪律见 `reference/rules.schema.md`。
