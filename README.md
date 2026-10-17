@@ -7,7 +7,7 @@
 ## 它是什么 / 不是什么
 
 - **是**：**两个 preset** 的声明（`- insert:`）：
-  - **Fly 安全模式** `preset-fly`（行表来自 `dsh-fly` 的 `presets/fly/agent.cordis.yml`，41 行）；
+  - **Fly 安全模式** `preset-fly`（行表来自 `dsh-fly` 的 `presets/fly/agent.cordis.yml`，45 行）；
   - **Fly 标准模式** `preset-fly-standard`（行表 = **上游 `standard` 的行表** + 一行 smart，33 行）——
     由生成器从**引擎自己的组合结果**里取上游行表（不手抄），所以引擎升级后行表跟着走、漂了 `--check` 会红。
   其中

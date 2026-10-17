@@ -45,7 +45,13 @@
           # ── identity ────────────────────────────────────────────────────────────────
 
           # The preset's own persona, shadowing the deployment default for this agent.
-          # `{{model}}` and `{{cwd}}` resolve from the agent's own route and workspace.
+          # `{{model}}` resolves from the agent's own route.
+          #
+          # **`{{cwd}}` 从 0.2.1-rc.2 起不再由引擎注册**（上游 `packages/core/system-prompt/README.zh.md:78`：
+          # 「循环不注册它，因此无法解析的引用会在任何模型请求之前使提示词组装失败」，测试原文
+          # `unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"`）。工作目录改由
+          # `dsh-session-working-directory` 作为**必需的 user context** 提供，所以这里只留 `{{model}}`。
+          # 这条**门禁看不见**（装配/验收都不真的组一次 prompt），由 `scripts/tests/preset-vars.spec.mjs` 静态钉住。
           #
           # `prefix`/`suffix` are the schema (`dsh-persona`: `prefix` required, `suffix`
           # defaulted, `text` is a *boolean* interpolation switch). A `text: <string>` row
@@ -56,12 +62,17 @@
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: You are a coding agent powered by the {{model}} model.
-              suffix: Your working directory is {{cwd}}.
 
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+
+          # 0.2.1-rc.2 新增：上游把「当前时间」从 loop 的提示词变量改成一个**上下文 provider**
+          # （`dsh-time-context`）。standard 与 cordis 都带这一行，Fly 照抄 —— 少了它，模型失去
+          # 时间感（会话里问「今天几号」会答成训练期），而门禁看不出来（没有工具调用失败）。
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
 
           # ── shell ───────────────────────────────────────────────────────────────────
 
@@ -103,6 +114,12 @@
           # chooses is whether its agent can collect and stop background work at all.
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+
+          # 0.2.1-rc.2 新增：上游把「定时/排程」从随附 profile 里**休眠的行**升级成 standard 与
+          # cordis 都带的常规行（`@deepseek-ai/dsh-tool-schedule`）。照抄上游 —— 行差集是判据，
+          # 少一行 = 会话里没这个能力（"全绿但能力没了"）。
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
 
           # ── skills ──────────────────────────────────────────────────────────────────
 
@@ -164,7 +181,7 @@
                 name: '@deepseek-ai/dsh-plan-mode'
                 config:
                   section: |
-                        You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+                        You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
 
                         Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
 
@@ -408,6 +425,13 @@
             name: '@deepseek-ai/dsh-plugin-manager/tools'
             disabled: !!js "!ctx.get('profileContext')"
 
+          # 0.2.1-rc.2 新增的插件市场工具。standard 里它是**休眠行**（`disabled: true`），创造模式才按
+          # `profileContext` 打开；Fly 照抄 standard 的取值（保持"Fork = standard + 安全工具面"），
+          # 要不要给 Fly 打开是产品决定，不是这次升级顺带改的默认值。
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true
+
           # 这道门自己。它不注册任何工具（只挂 `tools/pre-execute` 的 waterfall），但仍是一行 preset 行：
           # 门必须与它管的东西在同一个 scope 里（`inject: ['tools']`）。行 id 用 `tool-` 前缀不是口味问题 ——
           # `scripts/lib/fly-profile.mjs` 的 `toolPackages` 是装配的唯一实现，门禁（含
@@ -427,12 +451,13 @@
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              suffix: Your working directory is {{cwd}}.
               prefix: You are a coding agent powered by the {{model}} model.
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
               maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
           - id: tool-bash
             name: '@deepseek-ai/dsh-tool-bash'
             disabled: !!js process.platform === 'win32'
@@ -447,6 +472,8 @@
               sampleOverCapGlobResults: false
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
           - id: tool-skill
@@ -465,13 +492,13 @@
                 name: '@deepseek-ai/dsh-plan-mode'
                 config:
                   section: >
-                    You are in plan mode. Stay in plan mode until exit_plan_mode
-                    succeeds or the user switches the session mode. Imperative
-                    language to implement changes means plan the implementation, not
-                    execute it. A user's conversational agreement — including an
-                    answer confirming something you asked — approves nothing and
-                    does not end plan mode; fold the confirmed decision into the
-                    plan and submit it through exit_plan_mode.
+                    You are in plan mode. Stay in plan mode until the user approves
+                    your plan through exit_plan_mode or switches the session mode.
+                    Imperative language to implement changes means plan the
+                    implementation, not execute it. A user's conversational
+                    agreement — including an answer confirming something you asked —
+                    approves nothing and does not end plan mode; fold the confirmed
+                    decision into the plan and submit it through exit_plan_mode.
                     Explore first. Use non-mutating reads, searches, static
                     analysis, and checks to ground the plan in the actual
                     repository. Do not edit or write files, change configuration,
@@ -539,41 +566,17 @@
                   provider: spawn
                   toolName: subagent
                   modelSelectionSettings: true
-                  backgroundMode: continuable
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
-              - id: tool-subagent-codex
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: codex
-                  toolName: subagent_codex
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
-              - id: tool-subagent-claude-code
-                name: '@deepseek-ai/dsh-tool-subagent'
-                disabled: true
-                config:
-                  provider: claude-code
-                  toolName: subagent_claude_code
-                  backgroundMode: one-shot
-                  maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
                 config:
                   provider: spawn
               - id: tool-workflow
                 name: '@deepseek-ai/dsh-tool-workflow'
-              - id: tool-ralph
-                name: '@deepseek-ai/dsh-tool-ralph'
-                disabled: true
-                config:
-                  subagentProvider: spawn
-                  maxRounds: 64
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
           - id: tool-todo
@@ -589,6 +592,9 @@
             name: '@deepseek-ai/dsh-tool-present'
           - id: tool-plugin-manager
             name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
             disabled: true
           - id: tool-fly-smart
             name: dsh-plugin-fly-smart/tools/index.js
