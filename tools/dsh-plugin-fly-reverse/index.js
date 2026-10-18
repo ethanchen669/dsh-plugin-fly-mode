@@ -522,6 +522,76 @@ function scanGadgets(disasm, filter) {
 export function apply(ctx) {
   const shell = ctx.shell
 
+/**
+ * Mach-O 的 arch 切片列表（`lipo -archs`）。**不是 Mach-O / lipo 不在 ⇒ null**（不猜、也不硬塞 --arch）。
+ *
+ * 为什么必须问它：cctools 的 `objdump -d` 对**胖体**文件只取**第一个 slice**。实测 /bin/ls 的 fat 头是
+ * `x86_64 arm64e unknown(...)` ⇒ 默认反出的是 x86_64（`pushq %rbp`），而机器真正跑的是 arm64e
+ * （`add x0, x0, #0x68`）。**两份是不同的代码**：地址、指令、符号全对不上，而且**不报任何错**。
+ */
+async function machoArches(shell, exec, path) {
+  const run = await runCmd(shell, ['lipo', '-archs', path], exec, { timeoutMs: 20_000 })
+  if (run.exitCode !== 0) return null
+  const tokens = (run.stdout ?? '').trim().split(/\s+/u).filter(token => token !== '' && !token.startsWith('unknown('))
+  return tokens.length === 0 ? null : tokens
+}
+
+/**
+ * 选一个 arch 切片（纯函数，好测）：
+ *   · available 为 null（非 Mach-O）⇒ null ⇒ 调用方**不加** --arch；
+ *   · 显式 wanted ⇒ 必须真在这个文件里，否则 **ArgumentError** 并列出可用的。cctools 只认 fat 头里的
+ *     **精确**名字（实测 --arch=arm64 / --arch=ARM64 都失败，**而且退出码还是 0**）⇒ 这里做大小写归一 +
+ *     `arm64 → arm64e` 映射，保证喂给 objdump 的永远是 fat 头里那个名字；
+ *   · 不给 ⇒ 按偏好挑（arm64e > arm64 > x86_64 > …），并把"自动选了谁"记进信封。
+ */
+function pickMachoArch(available, wanted) {
+  if (available === null || available === undefined || available.length === 0) return null
+  const raw = wanted === undefined || wanted === null ? '' : String(wanted).trim()
+  if (raw !== '') {
+    if (available.includes(raw)) return { arch: raw, source: 'explicit' }
+    const lower = raw.toLowerCase()
+    const sameName = available.find(name => name.toLowerCase() === lower)
+    if (sameName !== undefined) return { arch: sameName, source: 'explicit（大小写归一：' + raw + ' → ' + sameName + '）' }
+    if (lower === 'arm64') {
+      const arm64eName = available.find(name => name.toLowerCase() === 'arm64e')
+      if (arm64eName !== undefined) return { arch: arm64eName, source: 'explicit（arm64 → ' + arm64eName + '：fat 头里只有这个名字）' }
+    }
+    const error = new Error('arch=' + raw + ' 在这个文件的切片里不存在 —— 可用的是 ' + available.join(' ')
+      + '（cctools 只认 fat 头里的精确名字）')
+    error.name = 'ArgumentError'
+    throw error
+  }
+  for (const want of ['arm64e', 'arm64', 'x86_64', 'i386', 'ppc64', 'ppc']) {
+    const hit = available.find(name => name.toLowerCase() === want)
+    if (hit !== undefined) return { arch: hit, source: 'auto（偏好 ' + want + '）' }
+  }
+  return { arch: available[0], source: 'auto（第一个切片）' }
+}
+
+/** --arch= 参数（choice 为 null 就不加）。 */
+function objdumpArchArgs(choice) {
+  return choice === null ? [] : ['--arch=' + choice.arch]
+}
+
+/**
+ * objdump --arch= 的失败**退出码是 0**（实测：does not contain architecture / unknown architecture
+ * named）⇒ 只看退出码接不住。把这类错误文本当**响亮失败**，别让它冒充"反汇编成功"。
+ */
+function objdumpArchFailure(text, arch) {
+  if (/does not contain architecture|unknown architecture named/u.test(text)) {
+    return 'objdump --arch=' + arch + ' 被拒（cctools 只认 fat 头里的精确名字）：'
+      + String(text).trim().split('\\n')[0].slice(0, 160)
+  }
+  return null
+}
+
+/** 胖体 Mach-O 的切片声明（进 limitations 的正文，别让"只反了一片"藏起来）。 */
+function machoArchNote(available, choice) {
+  if (available === null || choice === null) return null
+  return '胖体 Mach-O：这次只看了 **' + choice.arch + '** 这一片（' + choice.source + '）；文件里的切片有 '
+    + available.join(' ') + '。cctools 的默认行为是取**第一个** slice（常常是 x86_64），要别的切片请传 arch='
+}
+
   ctx.tools.register(defineTool({
     name: 'rev_imports',
     description: 'List imported (undefined) symbols.',
@@ -536,7 +606,9 @@ export function apply(ctx) {
       const path = safePath(args.path)
       const kindRun = await runCmd(shell, ['file', '-b', path], exec)
       const kind = kindRun.exitCode === 0 ? kindRun.stdout.trim() : ''
-      const dynamic = await runCmd(shell, ['objdump', '-T', path], exec)
+      const availableArches = await machoArches(shell, exec, path)
+      const archChoice = pickMachoArch(availableArches, args.arch)
+      const dynamic = await runCmd(shell, ['objdump', '-T', ...objdumpArchArgs(archChoice), path], exec)
       const dynamicLines = dynamic.exitCode === 0
         ? dynamic.stdout.split('\n').filter((l) => l.includes('DF') && l.includes('*UND*')).map((l) => l.trim())
         : []
@@ -545,7 +617,7 @@ export function apply(ctx) {
           tool: 'rev_imports',
           target: args.path,
           operation: 'list undefined (imported) symbols: objdump -T (DF *UND*)',
-          observed: { method: 'objdump', shown: Math.min(dynamicLines.length, 300), dump: dynamicLines.slice(0, 300).join('\n') },
+          observed: { method: 'objdump', arch: archChoice === null ? null : archChoice.arch, archSource: archChoice === null ? null : archChoice.source, availableArches, shown: Math.min(dynamicLines.length, 300), dump: dynamicLines.slice(0, 300).join('\n') },
           confidence: 'observed',
           limitations: [
             '只列**动态**符号表（.dynsym）里的未定义项：静态链接进来的、或本地定义的符号不在里面',
@@ -556,7 +628,7 @@ export function apply(ctx) {
       // `objdump -T` exits 0 with a bare table header for Mach-O, and a stripped
       // ELF may have no dynamic symbol table at all. `nm -u` is the portable
       // second opinion (it ships with macOS and the Xcode CLT).
-      const nm = await runCmd(shell, ['nm', '-u', path], exec, { stdoutMaxBytes: 4194304 })
+      const nm = await runCmd(shell, ['nm', '-u', ...(archChoice === null ? [] : ['-arch', archChoice.arch]), path], exec, { stdoutMaxBytes: 4194304 })
       const undefinedSymbols = nm.exitCode === 0
         ? nm.stdout.split('\n').map((l) => l.trim()).filter((l) => /^_?[A-Za-z_][\w$.@]*$/u.test(l))
         : []
@@ -565,13 +637,14 @@ export function apply(ctx) {
           tool: 'rev_imports',
           target: args.path,
           operation: 'list undefined (imported) symbols: nm -u (objdump -T had no dynamic table)',
-          observed: { method: 'nm -u', format: kind === '' ? null : kind, shown: Math.min(undefinedSymbols.length, 300), dump: [
+          observed: { method: 'nm -u', arch: archChoice === null ? null : archChoice.arch, archSource: archChoice === null ? null : archChoice.source, availableArches, format: kind === '' ? null : kind, shown: Math.min(undefinedSymbols.length, 300), dump: [
           `${kind === '' ? 'format unknown' : kind}: no ELF dynamic symbol table to read, so these are the undefined symbols from nm -u (${undefinedSymbols.length}):`,
           ...undefinedSymbols.slice(0, 300),
           ].join('\n') },
           confidence: 'observed',
           limitations: [
             '走的是 nm -u 这条**回退**路径：objdump -T 在这个文件上没有动态符号表（Mach-O 常见）',
+            ...(machoArchNote(availableArches, archChoice) === null ? [] : [machoArchNote(availableArches, archChoice)]),
             'nm -u 只报"未定义"的名字，不告诉你是从哪个库来的（要库映射得看 otool -L / readelf -d）',
           ],
         }, null, 2)
@@ -580,7 +653,7 @@ export function apply(ctx) {
         tool: 'rev_imports',
         target: args.path,
         operation: 'list undefined (imported) symbols: both objdump -T and nm -u came back empty',
-        observed: { method: null, format: kind === '' ? null : kind, shown: 0, dump: [
+        observed: { method: null, arch: archChoice === null ? null : archChoice.arch, archSource: archChoice === null ? null : archChoice.source, availableArches, format: kind === '' ? null : kind, shown: 0, dump: [
         `no undefined symbols for ${args.path}: objdump -T (exit ${dynamic.exitCode}) and nm -u (exit ${nm.exitCode}) both came back empty`,
         `format: ${kind === '' ? 'unknown (file(1) reported nothing)' : kind}`,
         `nm -u stderr: ${nm.stderr.trim().slice(0, 200) || '(empty)'}`,
@@ -604,6 +677,7 @@ export function apply(ctx) {
       path: { type: 'string', required: true },
       start: { type: 'string', description: 'Optional start address, e.g. 0x4011a6' },
       stop: { type: 'string', description: 'Optional stop address' },
+      arch: { type: 'string', description: 'Mach-O slice (e.g. arm64e / x86_64); omitted: pick from lipo -archs (arm64e > arm64 > x86_64)' },
     },
     output: {
       schema: { type: 'string' },
@@ -611,20 +685,33 @@ export function apply(ctx) {
     },
     async execute(args, exec) {
       const path = safePath(args.path)
-      const argv = ['-d', path]
-      if (args.start && args.stop) argv.splice(1, 0, `--start-address=${args.start}`, `--stop-address=${args.stop}`)
-      const stdout = requireOk(await runCmd(shell, ['objdump', ...argv], exec, { stdoutMaxBytes: 1048576 }), 'objdump -d')
+      const availableArches = await machoArches(shell, exec, path)
+      const archChoice = pickMachoArch(availableArches, args.arch)
+      const argv = ['-d', ...objdumpArchArgs(archChoice), path]
+      if (args.start && args.stop) argv.splice(1, 0, '--start-address=' + args.start, '--stop-address=' + args.stop)
+      const rawDisasm = await runCmd(shell, ['objdump', ...argv], exec, { stdoutMaxBytes: 1048576 })
+      const archFailure = objdumpArchFailure((rawDisasm.stdout ?? '') + (rawDisasm.stderr ?? ''), archChoice === null ? '' : archChoice.arch)
+      if (archFailure !== null) throw new Error(archFailure)
+      const stdout = requireOk(rawDisasm, 'objdump -d')
       // 证据形状（规划 §5.1）：信封 JSON，objdump 输出原样进 observed.dump。
       return JSON.stringify({
         tool: 'rev_disasm',
         target: args.path,
         operation: 'objdump -d' + (args.start && args.stop ? ` --start-address=${args.start} --stop-address=${args.stop}` : ' (whole file)'),
-        observed: { window: args.start && args.stop ? { start: args.start, stop: args.stop } : null, truncated: stdout.length > 12000, dump: stdout.slice(0, 12000) },
+        observed: {
+          arch: archChoice === null ? null : archChoice.arch,
+          archSource: archChoice === null ? null : archChoice.source,
+          availableArches,
+          window: args.start && args.stop ? { start: args.start, stop: args.stop } : null,
+          truncated: stdout.length > 12000,
+          dump: stdout.slice(0, 12000),
+        },
         confidence: 'observed',
         limitations: [
           stdout.length > 12000 ? '只给前 12000 字符（truncated=true）—— 要看后面请给 start/stop 缩小窗口' : '这次没有截断（输出 ≤ 12000 字符）',
           '反汇编是**线性扫描**的结果：数据段夹在代码里时，那些字节也会被当成指令打出来（用 start/stop 框住函数能少踩这个）',
           '不看控制流、不做函数边界识别（要那些得换真正的反编译器）',
+          ...(machoArchNote(availableArches, archChoice) === null ? [] : [machoArchNote(availableArches, archChoice)]),
         ],
       }, null, 2)
     },
@@ -636,6 +723,7 @@ export function apply(ctx) {
     parameters: {
       path: { type: 'string', required: true },
       filter: { type: 'string', description: 'Optional gadget filter, e.g. "pop rdi"' },
+      arch: { type: 'string', description: 'Mach-O slice for the built-in fallback scanner (e.g. arm64e); omitted: pick from lipo -archs' },
     },
     output: {
       schema: { type: 'string' },
@@ -659,14 +747,19 @@ export function apply(ctx) {
           ],
         }, null, 2)
       }
-      const disasm = requireOk(await runCmd(shell, ['objdump', '-d', path], exec, { stdoutMaxBytes: 1048576 }), 'objdump -d')
+      const gadgetArches = await machoArches(shell, exec, path)
+      const gadgetArch = pickMachoArch(gadgetArches, args.arch)
+      const gadgetRaw = await runCmd(shell, ['objdump', '-d', ...objdumpArchArgs(gadgetArch), path], exec, { stdoutMaxBytes: 1048576 })
+      const gadgetArchFailure = objdumpArchFailure((gadgetRaw.stdout ?? '') + (gadgetRaw.stderr ?? ''), gadgetArch === null ? '' : gadgetArch.arch)
+      if (gadgetArchFailure !== null) throw new Error(gadgetArchFailure)
+      const disasm = requireOk(gadgetRaw, 'objdump -d')
       const gadgets = scanGadgets(disasm, args.filter)
       if (gadgets.length > 0) {
         return JSON.stringify({
           tool: 'rev_gadget_scan',
           target: args.path,
           operation: 'built-in scanner over objdump -d (ROPgadget not installed)' + (args.filter ? ` filtered by ${args.filter}` : ''),
-          observed: { method: 'builtin', shown: Math.min(gadgets.length, 80), truncated: gadgets.length > 80, dump: gadgets.slice(0, 80).join('\n') },
+          observed: { method: 'builtin', arch: gadgetArch === null ? null : gadgetArch.arch, shown: Math.min(gadgets.length, 80), truncated: gadgets.length > 80, dump: gadgets.slice(0, 80).join('\n') },
           confidence: 'observed',
           limitations: [
             '走的是**内置扫描器**（本机没有 ROPgadget）：它只在 objdump 的反汇编里找 pop/leave + 紧跟的 ret 这类**简单序列**',
@@ -679,7 +772,7 @@ export function apply(ctx) {
         tool: 'rev_gadget_scan',
         target: args.path,
         operation: 'built-in scanner over objdump -d: nothing matched',
-        observed: { method: 'builtin', shown: 0, dump: `no pop/leave/ret gadgets found in ${args.path} (install ROPgadget for a deeper scan)` },
+        observed: { method: 'builtin', arch: gadgetArch === null ? null : gadgetArch.arch, shown: 0, dump: `no pop/leave/ret gadgets found in ${args.path} (install ROPgadget for a deeper scan)` },
         confidence: 'observed',
         limitations: [
           '**没找到 ≠ 没有**：这条走的是内置扫描器（只认 pop/leave + ret 的简单序列），装 ROPgadget 后同一条命令可能给出几十条',
