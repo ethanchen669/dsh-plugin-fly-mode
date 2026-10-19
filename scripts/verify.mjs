@@ -66,16 +66,18 @@ function presetRowsOf(entryId) {
 }
 const flyBlock = presetRowsOf('preset-fly')
 const standardBlock = presetRowsOf('preset-fly-standard')
-check('安全模式行表齐（45 行 + 声明自身）', flyBlock !== null && flyBlock.filter(line => /^\s+- id: /u.test(line)).length === 46)
+check('安全模式行表齐（46 行 + 声明自身）', flyBlock !== null && flyBlock.filter(line => /^\s+- id: /u.test(line)).length === 47)
 check('标准模式行表齐（33 行 + 声明自身）', standardBlock !== null && standardBlock.filter(line => /^\s+- id: /u.test(line)).length === 34)
 check('① 不含三个模型路由键（用户机器状态）', !/^\s*(brain|hand|review)Route\s*:/mu.test(patch))
 check('② 不含 registry 的 default 覆盖（默认归上游 standard）', !/^\s+default:/mu.test(patch))
 check('不带浏览器半边（dsh.client）', manifest.dsh?.client === undefined)
 check('不带 Fly 外壳（dsh-plugin-fly-shell）', !JSON.stringify(manifest.dependencies ?? {}).includes('fly-shell'))
-// 形状（用户 2026-10-11 裁决）：**7 个工具内联进包**（行表用本包子路径）+ **fly-smart 单独一个
+// 形状（用户 2026-10-11 裁决，2026-10-19 扩到两个外部件）：**7 个工具内联进包**（行表用本包子路径）
+// + **fly-smart / engagement 各自一个外部包**（engagement 是新仓：面板行 + 工具子路径，bundle 与工具都由
+// `dsh plugin add` 装） + **fly-smart 单独一个
 // plugin**（本包 dependencies 里唯一的一项，由 npm 装进 profile，行表保持裸名）。
 const INLINED = ['dsh-plugin-fly-binary', 'dsh-plugin-fly-reverse', 'dsh-plugin-fly-pwn', 'dsh-plugin-fly-diag', 'dsh-plugin-fly-recon', 'dsh-plugin-fly-blackbox', 'dsh-plugin-fly-guard']
-check('dependencies 只有 fly-smart 一个（其余 7 个已内联）', JSON.stringify(manifest.dependencies ?? {}) === JSON.stringify({ 'dsh-plugin-fly-smart': manifest.dependencies?.['dsh-plugin-fly-smart'] }), JSON.stringify(manifest.dependencies))
+check('dependencies 只有 fly-smart 与 engagement 两个（其余 7 个已内联）', JSON.stringify(manifest.dependencies ?? {}) === JSON.stringify({ 'dsh-plugin-fly-smart': '^0.1.2', '@dsh-fly/dsh-plugin-fly-engagement': '^0.1.4' }))
 for (const tool of INLINED) {
   const entry = `tools/${tool}/index.js`
   check(`内联：${entry} 在包里`, existsSync(join(ROOT, entry)))
@@ -99,7 +101,7 @@ check('preset-fly-standard 的 config.id 是 fly-standard', /^\s*id: fly-standar
   const totalRows = patch.split('\n').filter(line => /^\s+- id: /u.test(line)).length
   check('标准模式恰好一行 smart', smartRows.length === 1)
   check('标准模式**不含**任何安全工具行', securityRows.length === 0, securityRows.slice(0, 2).join(' | '))
-  check('整份 patch 的行数 == 两个 preset 之和（46 + 34）', totalRows === 80, String(totalRows))
+  check('整份 patch 的行数 == 两个 preset 之和（47 + 34）', totalRows === 81, String(totalRows))
 }
 check('files 里有声明文件与 tools/', (manifest.files ?? []).some(name => name.endsWith('cordis.patch.yml')) && (manifest.files ?? []).includes('tools'))
 // 内网 provider / 内网模型 id 不许进包（同 dsh-fly 主仓 shipping-hygiene 的两条红线）

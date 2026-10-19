@@ -366,6 +366,12 @@
           # 所以**不**是 blackbox 那种三项声明面（多写一项 = 申请用不上的服务）。
           - id: tool-fly-artifact
             name: '@dsh-fly/dsh-plugin-fly-mode/tools/dsh-plugin-fly-artifact/index.js'
+          # engagement 记录面（规划 §11）：`eng_record`（goal/facts/findings/assets/edges，漏洞必须带复现
+          # 步骤）/ `eng_state`（投影 + dropped/refused/truncated）/ `eng_report`（Markdown）。记录落在**工作区**
+          # `<workspace>/.fly-engagement/events.jsonl`（append-only，投影=fold）；本包 `inject = ['tools', 'shell']`。
+          - id: tool-fly-engagement
+            name: '@dsh-fly/dsh-plugin-fly-engagement/tools/index.js'
+
           # ── fly smart mode ───────────────────────────────────────────────────────────
 
           # Smart 模式（docs/smart-mode-design.md）：先设计、后执行、再验收的双模型工作流。
