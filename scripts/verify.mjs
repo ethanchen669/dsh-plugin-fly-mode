@@ -77,7 +77,7 @@ check('不带 Fly 外壳（dsh-plugin-fly-shell）', !JSON.stringify(manifest.de
 // `dsh plugin add` 装） + **fly-smart 单独一个
 // plugin**（本包 dependencies 里唯一的一项，由 npm 装进 profile，行表保持裸名）。
 const INLINED = ['dsh-plugin-fly-binary', 'dsh-plugin-fly-reverse', 'dsh-plugin-fly-pwn', 'dsh-plugin-fly-diag', 'dsh-plugin-fly-recon', 'dsh-plugin-fly-blackbox', 'dsh-plugin-fly-guard']
-check('dependencies 只有 fly-smart 与 engagement 两个（其余 7 个已内联）', JSON.stringify(manifest.dependencies ?? {}) === JSON.stringify({ 'dsh-plugin-fly-smart': '^0.1.2', '@dsh-fly/dsh-plugin-fly-engagement': '^0.1.4' }))
+check('dependencies 只有 fly-smart 与 engagement 两个（其余 7 个已内联）', JSON.stringify(manifest.dependencies ?? {}) === JSON.stringify({ '@dsh-fly/dsh-plugin-fly-engagement': '^0.1.4', '@dsh-fly/dsh-plugin-fly-smart': '^0.2.0' }))
 for (const tool of INLINED) {
   const entry = `tools/${tool}/index.js`
   check(`内联：${entry} 在包里`, existsSync(join(ROOT, entry)))
@@ -88,10 +88,13 @@ for (const tool of INLINED) {
 // 工具行必须指向 `tools/index.js` 子路径 —— 裸名行进会话平面会把面板挂到每个会话上。
 // 引号可选：生成器写的是 `name: '<spec>'`，而 preset 源里那一行**不带引号** —— 判据写死引号
 // 会明明在却判没有（这一晚第四次踩，见 dsh-fly 的同一个坑）。
-const SMART_TOOL_ROW = 'dsh-plugin-fly-smart/tools/index.js'
+const SMART_PKG = '@dsh-fly/dsh-plugin-fly-smart'
+const SMART_TOOL_ROW = `${SMART_PKG}/tools/index.js`
 check('fly-smart 的工具行指向 tools 子路径',
   patch.includes(`name: '${SMART_TOOL_ROW}'`) || patch.includes(`name: ${SMART_TOOL_ROW}`))
-check('fly-smart 的裸名行**不**出现在行表里', !/^\s*name:\s*'?dsh-plugin-fly-smart'?\s*$/mu.test(patch))
+// **包名行不许出现在行表里**：那行是 smart 自己的 bundle patch（面板），这里只有工具行。
+// 判据跟着 `SMART_PKG` 走，不写死字面量 —— 包改名时尺子要一起认得。
+check('fly-smart 的包名行**不**出现在行表里', !/^\s*name:\s*'?@?[^'\s]*dsh-plugin-fly-smart'?\s*$/mu.test(patch))
 // 第二个 preset：**Fly 标准模式**（上游 standard 的行表 + smart，**不含**安全工具行）。
 check('preset-fly-standard 在包里', /^\s*- id: preset-fly-standard\s*$/mu.test(patch))
 check('preset-fly-standard 的 config.id 是 fly-standard', /^\s*id: fly-standard\s*$/mu.test(patch))
