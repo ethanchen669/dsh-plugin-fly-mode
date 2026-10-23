@@ -1,7 +1,7 @@
 # 发布：打 tag（v*）时用 OIDC + provenance 发到公开 npm。姿势照 @dsh-fly/dsh-plugin-fly-skins
 # 那份（已在生产用过），差别：纯声明包 ⇒ 跑本地 scripts/verify.mjs（不装依赖、不构建）；
 # 署名检查用等价的两行 git 查询；npm 升到 11（trusted publishing 需要 >= 11.5）。
-# 发布前必须：唯一依赖 dsh-plugin-fly-smart 已在 npm 上（0.1.0 已发）；7 个工具已内联在包内。
+# 发布前必须：依赖 `@dsh-fly/dsh-plugin-fly-smart` 已在 npm 上（0.2.x 起转 scope）；7 个工具已内联在包内。
 name: release
 
 on:
