@@ -74,6 +74,76 @@ dsh plugin --profile=web add @dsh-fly/dsh-plugin-fly-mode@0.1.3 --registry=https
   并且要把包名加进 `package.json` 的 **`dsh.profile.bundles`** —— 那一条才让它成为一层
   （只写 `dependencies` 是不会生效的）。
 
+## Linux（Ubuntu）支持
+
+2026-10-27 在 **Ubuntu 24.04 / Linux 6.8（x86_64）** 上逐工具实测并补齐。macOS 仍是主发布
+平台；Linux 侧优先用系统自带的数据源，**拿不到数据时大声报「没有数据」**，绝不把缺命令读成
+「链路正常 / 没有邻居 / 文件不存在」。
+
+| 工具 | Linux 数据源 / 行为 |
+| --- | --- |
+| `diag_host` / `diag_procs` | `uname` / `ps aux`（原本就可移植） |
+| `diag_net` | `ss -ltnp`（缺 `ss` 退 `netstat -ltnp`）；只列 TCP LISTEN，unix socket 不再冒充 listener |
+| `diag_net_rtt` | iputils `ping`：`-W 2`（秒）单包超时、`-w <deadline>` 整轮截止；网关默认从 `ip route` 取 |
+| `diag_net_watch` | 同一套 ping 参数；链路采样改为 `iw dev <if> link`；status 的 mtime 用 GNU `stat -c %Y`（BSD `-f %m` 兜底） |
+| `diag_wifi_link` | `iw dev` + `iw dev <if> link` + `/proc/net/wireless`（底噪）+ `iw reg get`（国家码）；没有无线接口 ⇒ `available:false` |
+| `diag_wifi_channels` | `iw phy <phy> info`（监管允许信道）+ `iw dev <if> scan dump`（只读缓存）；`iw` 读不到时退 `nmcli … wifi list --rescan no`（nmcli 不报带宽 ⇒ `widthMhz:null`，不当成 20） |
+| `diag_net_throughput` | `curl`；默认目标按平台选（Linux x64 / macOS arm64） |
+| `recon_ports` | `nmap` 缺失时用系统 `nc`：Linux `nc -z -w 1`，**不再传 macOS 的 `-G`**；`nc` 也没有 ⇒ 报错，不返回「全部 no-response」 |
+| `recon_http_fingerprint` | `curl`（原本就可移植） |
+| `bin_*` / `pwn_*` / `rev_disasm` / `rev_imports` / `rev_gadget_scan` | ELF 走 `readelf` / `objdump` / 内置解析器；Mach-O 的 `lipo`/`otool` 分支在 Linux 上自然不触发 |
+| `rev_ghidra` | `analyzeHeadless` 查找顺序：`GHIDRA_HOME` → `PATH` → `~/tools/ghidra_*` / `/opt/ghidra*` / `/usr/share/ghidra*`；JDK 从 `JAVA_HOME` → `~/tools/jdk-*/bin/java` → `command -v java` 反解，**最低版本读 `<GHIDRA_HOME>/Ghidra/application.properties` 的 `application.java.min`**（12.3 DEV = 25），低于它在 doctor 里报红 |
+| `bx_*`（blackbox） | 工作区取 `workingDirectory` 服务 / `exec.agent.session.header.cwd`；文件大小用 GNU `stat -c%s`；监听用 `ss -ltnp`（`lsof` 兜底）；CA 用 `openssl verify -CAfile <系统 bundle>` + `update-ca-certificates` 指引；系统代理用 GNOME `gsettings`；mitmdump 自动发现 `~/tools/mitmproxy-venv/bin/mitmdump`（或 `FLY_MITM_BIN` / PATH），缺装时给 Ubuntu 的 venv / pipx 指引 |
+| `artifact_*` | 原本就有 GNU `stat` / `wc -c` / `sha256sum` 兜底 |
+
+安装依赖（按需）：
+
+```bash
+sudo apt install -y iw netcat-openbsd openssl python3-venv   # Wi-Fi / recon / CA / mitmproxy
+# Ghidra：解压后设 GHIDRA_HOME，或放到 /opt/ghidra*；JDK 版本以 Ghidra 的
+# Ghidra/application.properties（application.java.min）为准（12.3 DEV 要 25）
+```
+
+### 本机持久安装（2026-10-28）
+
+这台 Ubuntu 上已经按下面布局装好，**不需要再设 `FLY_MITM_BIN` / `GHIDRA_HOME` /
+`JAVA_HOME`**：
+
+| 位置 | 内容 |
+| --- | --- |
+| `~/tools/jdk-25` | Temurin JDK 25.0.5（Ghidra 12.3 的最低版本） |
+| `~/tools/ghidra_12.3_DEV` | 从源码构建的 Ghidra headless 发行版（461MB，含 `support/analyzeHeadless` 与原生 decompile） |
+| `~/tools/mitmproxy-venv` | 从源码安装的 mitmproxy `13.0.0.dev`（Python 3.14） |
+| `~/.local/bin/mitmdump` | → `~/tools/mitmproxy-venv/bin/mitmdump`（已在 PATH 上） |
+| `~/.local/bin/ghidra-analyze` | 直接调 `analyzeHeadless` 的包装（自动带 JDK 25） |
+
+工具侧自动发现：blackbox 先看 `~/tools/mitmproxy-venv/bin/mitmdump`，`rev_ghidra` 先看
+`~/tools/ghidra_*` 与 `~/tools/jdk-*`；都支持用环境变量覆盖。
+
+已知边界（如实写出来，不当成"支持"）：
+
+- **无线**：本次测试机没有 Wi-Fi 硬件，`iw`/`nmcli` 解析器用夹具做了回归（20 条 Linux
+  可移植性检查），**没有在真实射频上跑过**；上表两个无线工具在无接口时返回 `available:false`。
+- **ICMP**：`diag_net_rtt` / `diag_net_watch` 需要 `CAP_NET_RAW`（Ubuntu 的 `ping` 通常带
+  `cap_net_raw`）；在禁 raw socket 的沙箱里会明确报错。本次沙箱即如此，参数构造用假 `ping`
+  验证过。
+- **mitmproxy**：用 clone 的 `13.0.0.dev` 建 venv 后实测：`bx_proxy start/status/stop`、
+  HTTP 与 HTTPS 各 200、`bx_doctor` ①–⑤ 全过、`bx_flows` 读真实 dump（2 条 flow，flow
+  format 21 与读取器一致）。仍未验证：真实客户端（微信小程序等）的 pinning 与"只读启动时
+  系统代理"行为。
+- **Ghidra**：从 clone 构建 `12.3 DEV`（JDK 25）后实测：doctor（JDK 25 + 原生
+  `os/linux_x86_64/decompile` 都在）、`functions`、`decompile`、`decompile-many`、`strings`、`xrefs`、`trace`
+  均跑通；`decompile` 指定不存在函数时的报错文案也已修正。构建 Ghidra 12.3 **必须 JDK 25**
+  （`application.java.min=25`），只装 JDK 11/21 会被 doctor 明确拦下。仍未验证：反编译质量、
+  超大二进制的耗时。
+- **GNOME 系统代理**：只影响读 `gsettings` 的应用；CLI 多数认 `http_proxy`/`https_proxy`，
+  工具输出里会同时给出宿主环境变量。
+- 授权门不变：`recon_*` 仍需 `FLY_ALLOW_RECON=1`，`bx_proxy`/`bx_sysproxy` 的写动作仍需
+  `FLY_ALLOW_INTERCEPT=1`；Linux 实现没有绕过任何一道门。
+
+门禁：`node scripts/verify.mjs` 现在包含 20 条 Linux 可移植性检查（纯函数、无新依赖），
+与原有包形状检查一起跑。
+
 ## 仓库状态（2026-10-11）
 
 - 形状定稿：一条 `- insert:` 声明 + 包内 `tools/`（8 个工具内联，行表用本包子路径引用）+

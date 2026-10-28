@@ -1,12 +1,14 @@
 /**
  * Link-layer report parsing for the `fly-diag` tool face.
  *
- * Pure functions only — no I/O, no `ctx`, no clock, no `system_profiler` call.
+ * Pure functions only — no I/O, no `ctx`, no clock, no command execution.
  * The collector commands live in `index.js`; this module turns their stdout into
- * numbers. The split exists for one reason: the tool face is only as honest as
+ * numbers. macOS reports come from `system_profiler`; Linux reports come from
+ * `iw` / `nmcli` / `/proc/net/wireless` (see the “Linux（Ubuntu）后端” section).
+ * The split exists for one reason: the tool face is only as honest as
  * this file, and this file can be pinned against captured fixtures
- * (`scripts/tests/wifi-report.spec.mjs`) instead of against whatever radio the
- * host running the gate happens to have.
+ * (`scripts/tests/wifi-report.spec.mjs` and `linux-portability.spec.mjs`)
+ * instead of against whatever radio the host running the gate happens to have.
  *
  * ## The `0 dBm` trap — why signal parsing is stricter than it looks
  *
@@ -399,4 +401,347 @@ export function parsePingStats(text) {
 export function parseSpeedSample(raw) {
   const value = Number(String(raw ?? '').trim())
   return Number.isFinite(value) && value > 0 ? value : null
+}
+
+// ── Linux（Ubuntu）后端 ──────────────────────────────────────────────────────
+//
+// macOS 的 `system_profiler` 在 Ubuntu 上不存在；Linux 侧用两张系统自带的表：
+//   · `iw dev <if> link` —— 当前关联（频率、信号、tx/rx 速率、MCS）；
+//   · `iw dev <if> scan dump` / `nmcli dev wifi list` —— 邻居（只读缓存，不触发扫描）。
+// 解析器全部是纯函数（无 I/O），夹具在 scripts/tests/linux-portability.spec.mjs。
+
+/**
+ * `ping` 的超时/截止时间参数在 BSD（macOS）与 iputils（Linux）上**语义不同**：
+ *
+ *   · macOS：`-W` 是单包超时（毫秒），`-t` 是整轮截止时间（秒）；
+ *   · Linux：`-W` 是单包超时（秒），`-w` 是整轮截止时间（秒），`-t` 是 **TTL**。
+ *
+ * 之前直接把 macOS 的 `-W 2000 -t 8` 搬到 Linux：`-W 2000` 变成 2000 秒超时，
+ * `-t 8` 把 TTL 压到 8 跳 —— WAN 超过 8 跳就永远不通，而网关丢包时整条命令要挂很久。
+ *
+ * @param platform - `process.platform`（`darwin` / `linux` / 其他）。
+ * @param host - 已校验的主机名或 IP 字面量。
+ * @param count - 每轮包数。
+ * @returns ping 的 argv 数组。
+ */
+export function pingArgv(platform, host, count) {
+  const seconds = Math.max(8, Math.ceil(count * 0.4) + 4)
+  if (platform === 'darwin') {
+    return ['ping', '-c', String(count), '-i', '0.2', '-W', '2000', '-t', String(seconds), '-q', host]
+  }
+  // Linux / 其他 POSIX（iputils 形状）：单包 2s、整轮 seconds 秒。
+  return ['ping', '-c', String(count), '-i', '0.2', '-W', '2', '-w', String(seconds), '-q', host]
+}
+
+/**
+ * 可移植的「文件最后修改时间」shell 片段：GNU `stat -c %Y` 优先，BSD `stat -f %m` 兜底。
+ *
+ * 直接写 `stat -f %m` 在 GNU 上会打印**文件系统信息**并 exit 1；旧代码把它塞进
+ * `$(( ... ))`，在 dash 里是语法错误 —— 整个 `status` 的后半段都不执行（不是只少一行）。
+ *
+ * @param quotedPath - 已经用单引号包好的路径。
+ * @returns 一段可嵌进 `sh -c` 的命令替换。
+ */
+export function portableMtimeCommand(quotedPath) {
+  return `stat -c %Y ${quotedPath} 2>/dev/null || stat -f %m ${quotedPath} 2>/dev/null || echo 0`
+}
+
+/**
+ * Linux 上列监听套接字：`ss` 优先，`netstat` 兜底；都只取 TCP。
+ *
+ * `netstat -an` 在 Linux 上把 **unix socket** 也写成 `LISTENING`，而旧过滤只看
+ * `includes('LISTEN')` —— 一张 80 行的表可能全是 unix socket，真正的 TCP 监听一个都没露出来。
+ *
+ * @param platform - `process.platform`。
+ * @param text - `ss -ltnp` / `netstat -ltnp` / `netstat -an` 的 stdout。
+ * @returns 只含 TCP 监听的行（保持原顺序）。
+ */
+export function filterListenerLines(platform, text) {
+  const lines = String(text ?? '').split('\n').map(line => line.trim()).filter(Boolean)
+  if (platform === 'linux') {
+    return lines.filter(line => /\bLISTEN\b/iu.test(line) && /^(?:LISTEN|tcp|tcp6)\b/iu.test(line))
+  }
+  return lines.filter(line => /\bLISTEN\b/iu.test(line))
+}
+
+/** 从 `ss -ltnp` / `lsof` 的输出里取 PID（去重，保持出现顺序）。 */
+export function listenerPids(text) {
+  const pids = []
+  for (const match of String(text ?? '').matchAll(/\bpid=(\d+)/gu)) pids.push(Number(match[1]))
+  return [...new Set(pids)]
+}
+
+/** `iw dev` → `[{ name, phy }]`。 */
+export function parseIwDev(text) {
+  const interfaces = []
+  let phy = null
+  for (const line of String(text ?? '').split('\n')) {
+    const phyLine = /^\s*phy#(\d+)\s*$/u.exec(line)
+    if (phyLine !== null) {
+      phy = `phy${phyLine[1]}`
+      continue
+    }
+    const iface = /^\s*Interface\s+(\S+)\s*$/u.exec(line)
+    if (iface !== null) interfaces.push({ name: iface[1], phy })
+  }
+  return interfaces
+}
+
+/** `iw reg get` → 国家码（`country CN:`）；`00`（未设）返回 null。 */
+export function parseIwReg(text) {
+  const match = /^\s*country\s+([A-Z0-9]{2}):/mu.exec(String(text ?? ''))
+  if (match === null || match[1] === '00') return null
+  return match[1]
+}
+
+/** 频率 → 信道号；不认识的频段返回 null。 */
+export function channelOfFrequency(freq) {
+  const value = Number(freq)
+  if (!Number.isFinite(value)) return null
+  if (value === 2484) return 14
+  if (value >= 2412 && value <= 2472) return (value - 2407) / 5
+  if (value >= 5000 && value < 5925) return (value - 5000) / 5
+  if (value >= 5955 && value <= 7115) return (value - 5950) / 5
+  return null
+}
+
+/** 信道号 → 报表里用的频段名（与 macOS 报表的 `2GHz` / `5GHz` 对齐）。 */
+export function bandOfChannel(channel) {
+  const value = Number(channel)
+  if (!Number.isFinite(value)) return null
+  if (value >= 1 && value <= 14) return '2GHz'
+  if (value >= 32 && value <= 177) return '5GHz'
+  if (value > 177 && value <= 233) return '6GHz'
+  return null
+}
+
+/**
+ * 频率 → 频段名。6GHz 的信道号从 1 重新开始，**只看信道号会把 6GHz ch1 认成 2.4GHz**
+ * —— 有 freq 时一律以它为准，`bandOfChannel` 只在没有 freq 时兜底。
+ */
+export function bandOfFrequency(freq) {
+  const value = Number(freq)
+  if (!Number.isFinite(value)) return null
+  if (value >= 2400 && value <= 2500) return '2GHz'
+  if (value >= 5000 && value < 5925) return '5GHz'
+  if (value >= 5925 && value <= 7125) return '6GHz'
+  return null
+}
+
+/** `tx bitrate: 866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2` → PHY 家族。 */
+function phyOfRate(text) {
+  const raw = String(text ?? '')
+  if (/HE-MCS|HE-NSS|802\.11ax/iu.test(raw)) return '802.11ax'
+  if (/VHT-MCS|VHT-NSS|802\.11ac/iu.test(raw)) return '802.11ac'
+  if (/\bMCS \d+/u.test(raw) || /\b(?:40|20)MHz\b/u.test(raw)) return '802.11n'
+  if (/\b(?:54|48|36|24|18|12|11|9|6|5\.5|2|1)\.?0? MBit\/s/u.test(raw)) return '802.11g'
+  return null
+}
+
+/** 速率行里的宽度（`80MHz`）→ 数字；不认识返回 null。 */
+function widthOfRate(text) {
+  const match = /(\d+)\s*MHz/u.exec(String(text ?? ''))
+  return match === null ? null : Number(match[1])
+}
+
+/** 速率行里的 MCS 号（`VHT-MCS 9` / `HE-MCS 11` / `MCS 15`）→ 数字。 */
+function mcsOfRate(text) {
+  const match = /(?:HE|VHT)?-?MCS\s+(\d+)/u.exec(String(text ?? ''))
+  return match === null ? null : Number(match[1])
+}
+
+/**
+ * `iw dev <if> link` → 与 macOS `parseNetworkEntry` 同形的当前链路记录。
+ *
+ * 返回 `null` 表示**没有关联**（`Not connected.`）—— 这是「没有数据」，不是「链路正常」。
+ *
+ * @param text - `iw dev <if> link` 的 stdout。
+ * @param options.noiseDbm - 可选底噪（来自 `/proc/net/wireless`；Linux 的 iw 不给）。
+ * @returns 链路记录，或 null。
+ */
+export function parseIwLink(text, { noiseDbm = null } = {}) {
+  const raw = String(text ?? '')
+  const connected = /^Connected to\s+([0-9a-f:]{17})/imu.exec(raw)
+  if (connected === null) return null
+  const field = key => new RegExp(`^\\s*${key}:\\s*(.*)$`, 'imu').exec(raw)?.[1]?.trim() ?? null
+  const freq = Number(field('freq'))
+  const channelLine = /^\s*channel:\s*(\d+)\s*\((\d+)\s*MHz\)(?:,\s*width:\s*(\d+)\s*MHz)?/imu.exec(raw)
+  const txRateLine = /^\s*tx bitrate:\s*([\d.]+)\s*MBit\/s(.*)$/imu.exec(raw)
+  const rxRateLine = /^\s*rx bitrate:\s*([\d.]+)\s*MBit\/s(.*)$/imu.exec(raw)
+  const rateLine = txRateLine?.[0] ?? rxRateLine?.[0] ?? ''
+  const signal = /^\s*signal:\s*(-?\d+(?:\.\d+)?)\s*dBm/imu.exec(raw)
+  const rssi = signal === null ? null : (Number(signal[1]) === 0 ? null : Number(signal[1]))
+  const noise = typeof noiseDbm === 'number' && Number.isFinite(noiseDbm) && noiseDbm !== 0 ? noiseDbm : null
+  const channel = channelLine !== null
+    ? Number(channelLine[1])
+    : (Number.isFinite(freq) ? channelOfFrequency(freq) : null)
+  const width = channelLine?.[3] !== undefined
+    ? Number(channelLine[3])
+    : widthOfRate(rateLine)
+  return {
+    phy: phyOfRate(rateLine),
+    channel,
+    band: bandOfFrequency(freq) ?? bandOfChannel(channel),
+    widthMhz: width,
+    security: null,
+    rssiDbm: rssi,
+    noiseDbm: noise,
+    snrDb: rssi === null || noise === null ? null : rssi - noise,
+    transmitRateMbps: txRateLine === null ? null : Number(txRateLine[1]),
+    receiveRateMbps: rxRateLine === null ? null : Number(rxRateLine[1]),
+    mcs: mcsOfRate(rateLine),
+    ssid: field('SSID'),
+    bssid: connected[1].toLowerCase(),
+  }
+}
+
+/**
+ * 一次记录仪样本的链路行 → 链路记录。
+ *
+ * macOS 的 `system_profiler` 片段按 `Key: value` 解析；Linux 的 `iw dev link` 片段按
+ * `parseIwLink` 解析。两条路都产出同一形状，`readWatch` 因此不用知道样本来自哪个平台。
+ */
+export function parseLinkSample(text) {
+  const raw = String(text ?? '')
+  if (/^Connected to\s/mu.test(raw) || /^\s*tx bitrate:/mu.test(raw) || /^\s*freq:/mu.test(raw)) {
+    return parseIwLink(raw) ?? parseNetworkEntry(raw.split('\n'))
+  }
+  return parseNetworkEntry(raw.split('\n'))
+}
+
+/**
+ * `iw list` / `iw phy <phy> info` 的 `Frequencies:` 段 → 可用信道表。
+ *
+ * 跳过 `disabled`；`no IR` 仍算可用（客户端可以被动接收，只是不能主动发探测）。
+ *
+ * @param text - `iw list` 或 `iw phy … info` 的 stdout。
+ * @returns `[{ channel, band }]`，按出现顺序去重。
+ */
+export function parseIwPhyChannels(text) {
+  const seen = new Set()
+  const channels = []
+  let inFrequencies = false
+  for (const line of String(text ?? '').split('\n')) {
+    if (/^\s*Frequencies:\s*$/u.test(line)) { inFrequencies = true; continue }
+    if (!inFrequencies) continue
+    if (/^\s*valid interface combinations:/u.test(line)) break
+    if (/^\s*[A-Za-z][A-Za-z ]+:\s*$/u.test(line) && !/^\s*\*/u.test(line)) { inFrequencies = false; continue }
+    const match = /^\s*\*\s*(\d+)\s*MHz\s*\[(\d+)\](.*)$/u.exec(line)
+    if (match === null) continue
+    if (/\bdisabled\b/iu.test(match[3])) continue
+    const channel = Number(match[2])
+    if (seen.has(channel)) continue
+    seen.add(channel)
+    channels.push({ channel, band: bandOfFrequency(Number(match[1])) ?? bandOfChannel(channel) })
+  }
+  return channels
+}
+
+/**
+ * `iw dev <if> scan dump` → 邻居列表（与 `parseWifiReport` 的 neighbors 同形）。
+ *
+ * 只读**已有**扫描缓存；不发探测请求，所以不会出现「工具把空口扫卡了」。
+ *
+ * @param text - `iw dev <if> scan dump` 的 stdout。
+ * @returns 网络记录数组。
+ */
+export function parseIwScanNeighbors(text) {
+  const blocks = []
+  let lines = null
+  const flush = () => {
+    if (lines === null) return
+    blocks.push(lines)
+    lines = null
+  }
+  for (const line of String(text ?? '').split('\n')) {
+    if (/^BSS\s+[0-9a-f:]{17}/iu.test(line)) {
+      flush()
+      lines = [line]
+      continue
+    }
+    if (lines !== null) lines.push(line)
+  }
+  flush()
+  const neighbors = []
+  for (const block of blocks) {
+    const body = block.join('\n')
+    const freq = Number(/^\s*freq:\s*(\d+)/imu.exec(body)?.[1])
+    const dsChannel = /DS Parameter set:\s*channel\s+(\d+)/iu.exec(body)?.[1]
+    const primary = /\*\s*primary channel:\s*(\d+)/iu.exec(body)?.[1]
+    const channel = Number(dsChannel ?? primary ?? (Number.isFinite(freq) ? channelOfFrequency(freq) : NaN))
+    if (!Number.isFinite(channel)) continue
+    let width = null
+    const widthMhz = /\*\s*channel width:\s*(\d+)\s*MHz/iu.exec(body)
+    const widthCode = /\*\s*channel width:\s*(\d+)(?:\s*\((\d+)\s*MHz\))?/iu.exec(body)
+    if (widthMhz !== null) width = Number(widthMhz[1])
+    else if (widthCode !== null) {
+      width = widthCode[2] !== undefined
+        ? Number(widthCode[2])
+        : ({ 0: 20, 1: 80, 2: 160, 3: 80 }[widthCode[1]] ?? null)
+    } else if (/secondary channel offset:\s*(?:above|below)/iu.test(body)) {
+      width = 40
+    }
+    const signal = /^\s*signal:\s*(-?\d+(?:\.\d+)?)\s*dBm/imu.exec(body)
+    const rssi = signal === null ? null : (Number(signal[1]) === 0 ? null : Number(signal[1]))
+    neighbors.push({
+      phy: /HE Operation|HE capabilities/iu.test(body) ? '802.11ax' : /VHT Operation|VHT capabilities/iu.test(body) ? '802.11ac' : /HT Operation|HT capabilities/iu.test(body) ? '802.11n' : null,
+      channel,
+      band: bandOfFrequency(freq) ?? bandOfChannel(channel),
+      widthMhz: width,
+      security: /RSN:/u.test(body) ? 'WPA2/WPA3' : /WPA:/u.test(body) ? 'WPA' : null,
+      rssiDbm: rssi,
+      noiseDbm: null,
+      snrDb: null,
+      transmitRateMbps: null,
+      mcs: null,
+    })
+  }
+  return neighbors
+}
+
+/**
+ * `nmcli -t -f CHAN,FREQ,SIGNAL dev wifi list --rescan no` → 邻居列表。
+ *
+ * nmcli 不报带宽 ⇒ `widthMhz: null`（未知，不是 20）。占用仍按主信道计入 80MHz 块；
+ * 输出里必须把这个限制写出来，别把「未知带宽」当成「窄带」。
+ *
+ * @param text - nmcli 的 stdout。
+ * @returns 网络记录数组。
+ */
+export function parseNmcliNeighbors(text) {
+  const neighbors = []
+  for (const line of String(text ?? '').split('\n')) {
+    if (line.trim() === '') continue
+    const [rawChannel, rawFreq, rawSignal] = line.split(':')
+    const freq = Number.parseInt(String(rawFreq ?? '').replace(/[^\d]/gu, ''), 10)
+    let channel = Number.parseInt(String(rawChannel ?? ''), 10)
+    if (!Number.isFinite(channel) && Number.isFinite(freq)) channel = channelOfFrequency(freq)
+    if (!Number.isFinite(channel)) continue
+    const rssi = Number(rawSignal)
+    neighbors.push({
+      phy: null,
+      channel,
+      band: bandOfFrequency(freq) ?? bandOfChannel(channel),
+      widthMhz: null,
+      security: null,
+      rssiDbm: Number.isFinite(rssi) && rssi !== 0 ? rssi : null,
+      noiseDbm: null,
+      snrDb: null,
+      transmitRateMbps: null,
+      mcs: null,
+    })
+  }
+  return neighbors
+}
+
+/** `/proc/net/wireless` 的底噪列 → dBm（0 / 缺失 ⇒ null）。 */
+export function parseProcNetWireless(text, iface) {
+  for (const line of String(text ?? '').split('\n')) {
+    // 形状：`wlp3s0: 0000   70.  -30.  -256 ...`（level / noise 带尾点）。
+    const match = /^\s*([^:]+):\s*[0-9a-f]+\s+([0-9a-f.]+)\s+(-?\d+)\.?\s+(-?\d+)\.?/iu.exec(line)
+    if (match === null || (iface !== undefined && match[1].trim() !== iface)) continue
+    const noise = Number(match[4])
+    return noise === 0 ? null : noise
+  }
+  return null
 }

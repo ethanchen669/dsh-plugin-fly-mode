@@ -19,6 +19,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { runLinuxPortabilityChecks } from './tests/linux-portability.spec.mjs'
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 /** 列出一个目录下的所有文件（相对路径）。 */
 function walkFiles(dir, prefix = '', found = []) {
@@ -131,6 +133,10 @@ check(
   repoName.length > 0 && String(manifest.repository?.url ?? '').includes(repoName),
   `${String(manifest.repository?.url ?? '(缺)')}  ← 仓名 ${repoName}`,
 )
+
+// Linux（Ubuntu）可移植性：纯函数、不装依赖。每一条都对应 2026-10 实测的一次故障
+// （ping 的 -W/-t、nc 的 -G、GNU 的 stat -f、macOS 的 security/networksetup/system_profiler）。
+for (const entry of runLinuxPortabilityChecks()) check(entry.name, entry.ok, entry.detail ?? '')
 
 const failed = checks.filter(entry => !entry.ok)
 console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`)
