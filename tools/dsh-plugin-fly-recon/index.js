@@ -1,5 +1,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
+import { ncInstallHint, ncProbeArgs } from './platform.js'
+
 /**
  * fly-recon — policy-gated recon tools.
  * Default posture: deny unless FLY_ALLOW_RECON=1 (authorization explicit).
@@ -212,10 +214,13 @@ export function apply(ctx) {
         ])
       }
       if (!portMissing(nmap)) return requireOk(nmap, 'nmap')
-      // `nmap` is not installed by default on macOS. Instead of failing outright
-      // (the previous behaviour) or returning an empty scan that reads as "target
-      // closed", scan with `nc`, which ships with the base system. The result is
-      // labelled: nc cannot tell closed from filtered, and does no fingerprinting.
+      // `nmap` is not installed by default on macOS (nor on a stock Ubuntu desktop).
+      // Instead of failing outright (the previous behaviour) or returning an empty
+      // scan that reads as "target closed", scan with `nc` when it is present; if
+      // neither exists we fail loudly rather than printing a table of no-response.
+      // The result is labelled: nc cannot tell closed from filtered, and does no
+      // fingerprinting. Option shape differs per platform (macOS has -G, OpenBSD nc
+      // does not) — see platform.js.
       if (expanded.length > 64) {
         return envelope({ method: 'nc', scanned: 0, cap: 64, requested: expanded.length, dump: [
           `nmap is not installed on this host: the built-in fallback scans with the system nc and is capped at 64 ports per call, but ${expanded.length} were requested`,
@@ -224,8 +229,22 @@ export function apply(ctx) {
           '请求超过内置回退的 64 端口上限 ⇒ **一个端口都没扫**（不是"扫了、没有开着的端口"）',
         ])
       }
+      // 扫之前先确认 nc 真的在：`nc` 不在时每一条 `if nc …` 都会走 else，
+      // 结果是**整张表都 no-response** —— 一个看起来完全正常的假扫描。
+      const probe = await runCmd(shell, ['sh', '-c', 'command -v nc'], exec, { timeoutMs: 10_000 })
+      if (probe.exitCode !== 0 || probe.stdout.trim() === '') {
+        const error = new Error(
+          'nmap 与 nc 都不在本机：内置回退没有可用的扫描器，拒绝返回一张"全部 no-response"的假表。\n'
+          + ncInstallHint(process.platform),
+        )
+        error.name = 'ToolError'
+        throw error
+      }
       const script = expanded
-        .map((port) => `if nc -z -G 1 -w 1 ${shq(host)} ${port} >/dev/null 2>&1; then echo '${port}/tcp open'; else echo '${port}/tcp no-response'; fi`)
+        .map((port) => {
+          const argv = ncProbeArgs(process.platform, host, port).map(shq).join(' ')
+          return `if ${argv} >/dev/null 2>&1; then echo '${port}/tcp open'; else echo '${port}/tcp no-response'; fi`
+        })
         .join('; ')
       const scan = await runCmd(shell, ['/bin/sh', '-c', script], exec, { timeoutMs: 120_000 })
       if (scan.exitCode !== 0 && scan.stdout.trim() === '') return requireOk(scan, 'nc -z')

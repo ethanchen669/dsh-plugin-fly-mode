@@ -36,13 +36,32 @@ import { createHash } from 'node:crypto'
 // `node:fs` 的**两个允许用途**（design §3.1）：① 下面三行读自带 skill 资产；
 // ② `writeState`/`clearState` 读写工作区内的自身状态文件。用户数据（dump、规则文件）
 // 一律走 `shell` 接缝，这样沙箱拒绝会以 SandboxError 报出来。
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // gzip 只用 Node 自带的 `zlib`：`.har.gz` 的识别**按 magic 判**，不新增依赖、也不靠扩展名。
 import { gunzipSync } from 'node:zlib'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { BUNDLED_SKILL_RANK } from '@deepseek-ai/dsh-skill'
+
+import {
+  caInstallLines,
+  caTrustNote,
+  caVerifyArgv,
+  GNOME_PROXY_KEYS,
+  gnomeProxyOffCommands,
+  gnomeProxyOnCommands,
+  gnomeProxyRestoreCommand,
+  listenerLinesForPort,
+  listenerListArgv,
+  listenerPidOfLine,
+  mitmInstallLines,
+  parseGsettingsValue,
+  parseStatSize,
+  quitHint,
+  statSizeArgv,
+} from './platform.js'
 
 export const name = 'fly-blackbox'
 /** 少一个 = 整棵 preset 被拒：provider 在 `apply()` 里注册，注不到 `skills` 就抛。 */
@@ -417,15 +436,39 @@ function missingTool(run) {
  * 取不到就**大声报错**：`process.cwd()` 是宿主的 cwd，拿它顶替会把状态文件与 dump 路径
  * 写到别处（AGENTS.md 坑表"禁 `process.cwd()` 兜底"）。`FLY_BLACKBOX_WORKSPACE` 只给
  * 无头/测试用。
+ *
+ * 取法按引擎版本演进（2026-10 在 Ubuntu 0.1.18 上实测：`exec.workspace` 根本不存在，
+ * 五个 bx_* 工具全部报"取不到工作区"）：
+ *   ① `workingDirectory` 服务（有就优先，它记录的是**当前** cwd，`cd` 过也准）；
+ *   ② `exec.agent.session.header.cwd`（Session 的创建目录，引擎一直有）；
+ *   ③ 老形状 `exec.workspace` / `exec.cwd` / `exec.session.workspace`（保留兼容）。
  */
-function workspaceRoot(exec) {
+function workspaceRoot(exec, ctx) {
   const explicit = process.env.FLY_BLACKBOX_WORKSPACE
   if (typeof explicit === 'string' && explicit.trim() !== '') return explicit
-  for (const candidate of [exec?.workspace, exec?.cwd, exec?.session?.workspace, exec?.agent?.session?.workspace]) {
+  const session = exec?.agent?.session
+  const directories = ctx?.get?.('workingDirectory')
+  if (session !== undefined && directories !== undefined && typeof directories.get === 'function') {
+    try {
+      const cwd = directories.get(session)
+      if (typeof cwd === 'string' && cwd.trim() !== '') return cwd
+    } catch {
+      // 服务在场但读不出这个 session：继续走下面的字段，不在这里吞掉结论。
+    }
+  }
+  for (const candidate of [
+    exec?.agent?.session?.header?.cwd,
+    exec?.session?.header?.cwd,
+    exec?.workspace,
+    exec?.cwd,
+    exec?.session?.workspace,
+    exec?.agent?.session?.workspace,
+  ]) {
     if (typeof candidate === 'string' && candidate.trim() !== '') return candidate
   }
   throw new Error(
-    '取不到当前会话的工作区（exec.workspace / exec.cwd / exec.session.workspace 都是空），'
+    '取不到当前会话的工作区（workingDirectory 服务、exec.agent.session.header.cwd、'
+    + 'exec.workspace / exec.cwd / exec.session.workspace 都是空），'
     + '拒绝用宿主 cwd 顶替：状态文件与 dump 路径会跟着错。'
     + '无头或验证场景请显式设 FLY_BLACKBOX_WORKSPACE=<绝对路径>。',
   )
@@ -467,6 +510,13 @@ function cdpListUrl(port) {
   return `http://127.0.0.1:${port}/json/list`
 }
 
+/** 怎么起一个带调试端口的 Chromium（按平台给可复制的命令）。 */
+function chromeCdpHint(port) {
+  return process.platform === 'darwin'
+    ? `open -a "Google Chrome" --args --remote-debugging-port=${port} --user-data-dir=/tmp/cdp-${port}`
+    : `google-chrome --remote-debugging-port=${port} --user-data-dir=/tmp/cdp-${port}   # 或 chromium / chromium-browser`
+}
+
 /** 连不上时的**大声**文案：是什么 + 为什么只可能是这几种 + 下一步（怎么起目标）。 */
 function cdpUnreachableError(port, run) {
   const detail = (run.stderr ?? '').trim().split('\n').filter(Boolean)[0] ?? ''
@@ -474,7 +524,7 @@ function cdpUnreachableError(port, run) {
     `连不上 CDP 调试端口 127.0.0.1:${port}：${detail === '' ? `curl 退出码 ${run.exitCode}` : detail}`,
     '—— 这一项**只连回环**，所以只剩三种可能：那个进程没在监听这个端口 / 端口号给错了 / 目标没带调试开关起来。',
     '怎么起一个带调试端口的目标（端口号自己换一个没人用的）：',
-    `  · Chromium 内核浏览器：open -a "Google Chrome" --args --remote-debugging-port=${port} --user-data-dir=/tmp/cdp-${port}`,
+    `  · Chromium 内核浏览器：${chromeCdpHint(port)}`,
     `  · Electron 应用：<App 可执行文件> --remote-debugging-port=${port}`,
     '顺带一句：调试端口开着就等于把那个界面完全交出去（能读 DOM、也能改它），用完关掉那个实例。',
   ].join('\n'))
@@ -700,7 +750,7 @@ async function cdpUnreachableDetail(shell, exec, port, error, { httpKnownOk = fa
       `连不上 CDP 调试端口 127.0.0.1:${port} —— HTTP 探针（/json/list）也失败：${detail === '' ? `curl 退出码 ${probe.exitCode}` : detail}`,
       `${wsShape}。两条路都不通 ⇒ 最可能是那个进程没在监听这个端口。`,
       '怎么起一个带调试端口的目标（端口号自己换一个没人用的）：',
-      `  · Chromium 内核浏览器：open -a "Google Chrome" --args --remote-debugging-port=${port} --user-data-dir=/tmp/cdp-${port}`,
+      `  · Chromium 内核浏览器：${chromeCdpHint(port)}`,
       `  · Electron 应用：<App 可执行文件> --remote-debugging-port=${port}`,
     ].join('\n')
   }
@@ -731,13 +781,21 @@ export function decodeBase64(text, what, path, opts = {}) {
   return Buffer.from(compact, 'base64')
 }
 
-/** `stat -f%z <path>`（BSD；根目录会多打 `File: …` 一行，所以取最后一行）。 */
+/**
+ * 文件字节数：平台各自的 stat 形状（GNU `-c%s` / BSD `-f%z`）。
+ *
+ * 旧实现写死 `stat -f%z`，Ubuntu 上它直接 exit 1（`-f` 是"显示文件系统"），于是
+ * `bx_har` 把每一份**存在**的 HAR 都报成"不存在或读不到"。
+ */
 async function statSizeVia(shell, exec, path, what) {
-  const run = await runCmd(shell, ['stat', '-f%z', path], exec, { timeoutMs: 15_000 })
-  if (run.exitCode !== 0) throw new Error(`${what} 不存在或读不到：${path} —— ${run.stderr.trim().split('\n').at(-1) ?? `exit ${run.exitCode}`}`)
-  const last = run.stdout.trim().split('\n').at(-1)?.trim() ?? ''
-  if (!/^\d+$/u.test(last)) throw new Error(`${what} 的大小读不出来：stat 返回 ${JSON.stringify(last)}`)
-  return Number(last)
+  const run = await runCmd(shell, statSizeArgv(process.platform, path), exec, { timeoutMs: 15_000 })
+  const size = run.exitCode === 0 ? parseStatSize(run.stdout) : null
+  if (size === null) {
+    throw new Error(
+      `${what} 不存在或读不到：${path} —— ${run.stderr.trim().split('\n').at(-1) ?? `exit ${run.exitCode}`}`,
+    )
+  }
+  return size
 }
 
 /**
@@ -841,28 +899,23 @@ function validateRules(text, path) {
 /** `FLY_MITM_BIN` 指向 mitmdump；缺省走 PATH。 */
 function mitmBin() {
   const configured = process.env.FLY_MITM_BIN
-  return typeof configured === 'string' && configured.trim() !== '' ? configured : 'mitmdump'
+  if (typeof configured === 'string' && configured.trim() !== '') return configured
+  // 持久安装（本机 ~/tools）优先于 PATH：不依赖 agent 会话继承了哪个 PATH。
+  for (const candidate of [
+    join(os.homedir(), 'tools', 'mitmproxy-venv', 'bin', 'mitmdump'),
+    join(os.homedir(), 'tools', 'mitmproxy', '.venv', 'bin', 'mitmdump'),
+  ]) {
+    if (existsSync(candidate)) return candidate
+  }
+  return 'mitmdump'
 }
 
-/** 本机 pip3 是 3.9.6，直接装只会得到 mitmproxy 9.0.1（dump 格式与 12.x 不同）。 */
-const INTERPRETER = '/opt/homebrew/bin/python3.14'
-const INSTALL_LINES = [
-  `${INTERPRETER} -m venv .venv-mitm`,
-  `.venv-mitm/bin/pip install -i https://pypi.org/simple mitmproxy`,
-]
-
-/** 缺 mitmdump 时的**大声**报错文案：两行命令 + 为什么必须点名解释器。 */
+/** 缺 mitmdump 时的**大声**报错文案：按平台给可复制的安装命令。 */
 function missingMitmdumpMessage(detail) {
   return [
     `本机没有可用的 mitmdump${detail === '' ? '' : `（${detail}）`} —— 这台机器上**没有抓包能力**，不是"追查失败"。`,
     '',
-    '装上它（两行，点名解释器很重要）：',
-    ...INSTALL_LINES.map(line => `  ${line}`),
-    '',
-    '为什么必须点名 /opt/homebrew/bin/python3.14：本机 pip3 是 3.9.6，直接 `pip3 install mitmproxy`',
-    '只会得到 9.0.1，而它写的 dump 格式与 12.x 不同（读取器会按版本闸拒绝）。',
-    '本机 pip 默认镜像曾解析失败（清华镜像连 six 都拉不到，报 `from versions: none`），',
-    '所以上面显式用 `-i https://pypi.org/simple` 走官方源。',
+    ...mitmInstallLines(process.platform),
     '',
     '装完用 `bx_proxy start` 会回显 `mitmdump --version`。',
   ].join('\n')
@@ -876,11 +929,65 @@ async function mitmdumpVersion(shell, exec) {
   return run.stdout.trim().split('\n').map(line => line.trim()).filter(Boolean).join('\n')
 }
 
-/** 复用的端口查询：谁在 LISTEN 这个端口。 */
+/**
+ * 复用的端口查询：谁在 LISTEN 这个端口。
+ *
+ * Linux 用 `ss -ltnp`（本机实测 `lsof` 在受限环境里对所有端口 exit 1，旧实现因此
+ * 永远认为"没有监听者"）；macOS 继续用 lsof。
+ */
 async function listenersOn(shell, exec, port) {
-  const run = await runCmd(shell, ['lsof', '-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], exec, { timeoutMs: 20_000 })
+  const run = await runCmd(shell, listenerListArgv(process.platform), exec, { timeoutMs: 20_000 })
   if (run.exitCode !== 0) return []
-  return run.stdout.split('\n').slice(1).map(line => line.trim()).filter(Boolean)
+  return listenerLinesForPort(process.platform, run.stdout, port)
+}
+
+/** 端口上第一个监听进程的 PID（用于 bx_proxy start 写状态文件）。 */
+async function listenerPidOn(shell, exec, port) {
+  const lines = await listenersOn(shell, exec, port)
+  for (const line of lines) {
+    const pid = listenerPidOfLine(process.platform, line)
+    if (pid !== null) return pid
+  }
+  // `ss` 在受限内核/沙箱里可能不给 pid= 字段（只列 socket）。Linux 上再问一次 lsof：
+  // 它看得到自己进程的 fd，够拿到刚起的 mitmdump。
+  if (process.platform !== 'darwin') {
+    const lsof = await runCmd(shell, ['lsof', '-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], exec, { timeoutMs: 20_000 })
+    const pid = lsof.exitCode === 0 ? Number.parseInt(lsof.stdout.trim().split('\n').filter(Boolean)[0] ?? '', 10) : NaN
+    if (Number.isInteger(pid) && pid > 0) return pid
+  }
+  return null
+}
+
+/** 读一个 gsettings 键；读不到返回 null（不把 "gsettings 缺席" 读成 "值就是空"）。 */
+async function readGsettings(shell, exec, qualifiedKey) {
+  const separator = qualifiedKey.indexOf(' ')
+  const schema = qualifiedKey.slice(0, separator)
+  const key = qualifiedKey.slice(separator + 1)
+  const run = await runCmd(shell, ['gsettings', 'get', schema, key], exec, { timeoutMs: 15_000 })
+  return run.exitCode === 0 ? parseGsettingsValue(run.stdout) : null
+}
+
+/**
+ * GNOME 系统代理的只读状态。
+ *
+ * 只覆盖读 `gsettings` 的桌面；KDE 等不读这些键，所以 `backend` 必须回给调用方
+ * （不能把 GNOME 的值冒充成"系统代理"）。
+ */
+async function gnomeProxyStatus(shell, exec) {
+  const probe = await runCmd(shell, ['sh', '-c', 'command -v gsettings'], exec, { timeoutMs: 10_000 })
+  if (probe.exitCode !== 0 || probe.stdout.trim() === '') {
+    return { available: false, backend: 'gsettings', reason: 'gsettings 不在本机（不是 GNOME 桌面，或没装 glib-2.0-bin）' }
+  }
+  const mode = await readGsettings(shell, exec, GNOME_PROXY_KEYS.mode)
+  return {
+    available: true,
+    backend: 'gsettings (GNOME)',
+    mode,
+    httpHost: await readGsettings(shell, exec, GNOME_PROXY_KEYS.httpHost),
+    httpPort: await readGsettings(shell, exec, GNOME_PROXY_KEYS.httpPort),
+    httpsHost: await readGsettings(shell, exec, GNOME_PROXY_KEYS.httpsHost),
+    httpsPort: await readGsettings(shell, exec, GNOME_PROXY_KEYS.httpsPort),
+  }
 }
 
 /** 状态 + 现实的一致性：`kill -0`（进程）与 `lsof`（端口）必须一致。 */
@@ -1594,7 +1701,7 @@ export function apply(ctx) {
     },
     output: stringOutput,
     async execute(args, exec) {
-      const root = workspaceRoot(exec)
+      const root = workspaceRoot(exec, ctx)
       const action = String(args.action ?? '')
       const port = args.port ?? Number(process.env.FLY_PROXY_PORT ?? 8080)
       const state = readState(root)
@@ -1700,6 +1807,9 @@ export function apply(ctx) {
           MITM_RULES: rules,
           MITM_CAPTURE: join(root, '.fly-blackbox', 'capture'),
           FLY_ALLOW_INTERCEPT: process.env.FLY_ALLOW_INTERCEPT === '1' ? '1' : '0',
+          // 不让 Python 把 __pycache__ 写进**包资产目录**（addon 就在 assets 里）：
+          // 实测 Ubuntu 上第一次 start 会在包内生成 .pyc，污染发布字节。
+          PYTHONDONTWRITEBYTECODE: '1',
         },
       })
       if (started.handle.status === 'completed' && started.handle.exitCode === 0 && started.peek().trim() === '') {
@@ -1713,9 +1823,8 @@ export function apply(ctx) {
         ready = (await listenersOn(shell, exec, port)).length > 0
       }
 
-      const pidRun = await runCmd(shell, ['lsof', '-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], exec, { timeoutMs: 20_000 })
-      const pid = Number.parseInt(pidRun.stdout.trim().split('\n').filter(Boolean)[0] ?? '', 10)
-      if (!Number.isInteger(pid)) {
+      const pid = await listenerPidOn(shell, exec, port)
+      if (pid === null) {
         const early = started.peek().trim().slice(-2000)
         const state = started.handle.status === 'running' ? '还在跑但没等到 LISTEN' : `${started.handle.status}（exit ${String(started.handle.exitCode)}）`
         throw new Error(`mitmdump ${state}，${port} 上没有可识别的 LISTEN 进程，拒绝写状态文件。${early === '' ? '' : `\n${early}`}`)
@@ -1753,7 +1862,7 @@ export function apply(ctx) {
     },
     output: stringOutput,
     async execute(args, exec) {
-      const root = workspaceRoot(exec)
+      const root = workspaceRoot(exec, ctx)
       const state = readState(root)
       const port = args.port ?? state?.port ?? Number(process.env.FLY_PROXY_PORT ?? 8080)
       const host = args.host ?? 'example.com'
@@ -1801,14 +1910,15 @@ export function apply(ctx) {
 
       // ③ 目标客户端是否出现（dump 里的 [NEW HOST] 计数来自 addon 的 all.log；用 dump 的 host 集合代替）
       const dump = state?.dump ?? join(root, '.fly-blackbox', 'flows.mitm')
-      const dumpRun = await runCmd(shell, ['stat', '-f%z', dump], exec, { timeoutMs: 15_000 })
-      if (dumpRun.exitCode !== 0) {
+      const dumpRun = await runCmd(shell, statSizeArgv(process.platform, dump), exec, { timeoutMs: 15_000 })
+      const dumpSize = dumpRun.exitCode === 0 ? parseStatSize(dumpRun.stdout) : null
+      if (dumpSize === null) {
         lines.push('info ③ 还没有 dump 文件 —— 目标客户端一次都没走过这条代理。')
-        lines.push('     注意：微信小程序（WeChatAppEx）**只在启动时读系统代理**，改完系统代理必须 ⌘Q 再开。')
+        lines.push(`     注意：${quitHint(process.platform)}`)
       } else {
         const hosts = await runCmd(shell, ['strings', dump], exec, { timeoutMs: 20_000, stdoutMaxBytes: 8 * 1024 * 1024 })
         const unique = new Set((hosts.stdout.match(/[a-z0-9-]+(?:\.[a-z0-9-]+)+/giu) ?? []).map(hit => hit.toLowerCase()))
-        lines.push(`ok   ③ dump 里出现过 ${unique.size} 个域名样本（dump ${dumpRun.stdout.trim()} 字节）`)
+        lines.push(`ok   ③ dump 里出现过 ${unique.size} 个域名样本（dump ${dumpSize} 字节）`)
         if (unique.size === 0) lines.push('     ⚠ 一个域名都没解析出来：可能只抓到握手，或客户端根本没走代理。')
       }
 
@@ -1825,18 +1935,40 @@ export function apply(ctx) {
         lines.push('     它们可能抢流量。确认系统代理指向我们之后，再看 ③ 有没有目标客户端的域名。')
       }
 
-      // ⑤ 系统代理：真实状态是 `Enabled`，不是 `Server`（本机现存残留正好是反例）
-      const scutil = await runCmd(shell, ['scutil', '--proxy'], exec, { timeoutMs: 20_000 })
-      if (scutil.exitCode !== 0) {
-        lines.push('info ⑤ 读不到系统代理（scutil 缺席或非 macOS）')
+      // ⑤ 系统代理：真实状态是「mode/Enabled」，不是「Server 有值」。
+      if (process.platform === 'darwin') {
+        const scutil = await runCmd(shell, ['scutil', '--proxy'], exec, { timeoutMs: 20_000 })
+        if (scutil.exitCode !== 0) {
+          lines.push('info ⑤ 读不到系统代理（scutil 失败）')
+        } else {
+          const httpEnabled = /HTTPEnable\s*:\s*(\d)/u.exec(scutil.stdout)?.[1]
+          const httpsEnabled = /HTTPSEnable\s*:\s*(\d)/u.exec(scutil.stdout)?.[1]
+          const server = /HTTPSProxy\s*:\s*(\S+)/u.exec(scutil.stdout)?.[1] ?? '(none)'
+          const enabled = httpEnabled === '1' || httpsEnabled === '1'
+          if (enabled) lines.push(`ok   ⑤ 系统代理 Enabled（HTTP=${httpEnabled}, HTTPS=${httpsEnabled}, Server=${server}）`)
+          else lines.push(`FAIL ⑤ 系统代理没开：Enabled 字段是 HTTP=${httpEnabled ?? '?'}/HTTPS=${httpsEnabled ?? '?'}（注意 Server 字段可能是残留的 ${server}，**它不代表生效**）`)
+          if (!enabled) lines.push(`     next: \`bx_sysproxy on\` 之后 ${quitHint(process.platform)}`)
+        }
+      } else if (process.platform === 'linux') {
+        const proxy = await gnomeProxyStatus(shell, exec)
+        if (!proxy.available) {
+          lines.push(`info ⑤ 读不到系统代理（${proxy.reason}）`)
+        } else {
+          const httpPointsHere = proxy.httpHost === '127.0.0.1' && Number(proxy.httpPort) === port
+          const httpsPointsHere = proxy.httpsHost === '127.0.0.1' && Number(proxy.httpsPort) === port
+          const enabled = proxy.mode === 'manual' && httpPointsHere && httpsPointsHere
+          if (enabled) {
+            lines.push(`ok   ⑤ GNOME 系统代理指向本机（mode=${proxy.mode}, http=${proxy.httpHost}:${proxy.httpPort}, https=${proxy.httpsHost}:${proxy.httpsPort}）`)
+          } else {
+            fail(
+              `⑤ GNOME 系统代理没指向本机：mode=${proxy.mode ?? '?'} · http=${proxy.httpHost ?? '?'}:${proxy.httpPort ?? '?'} · https=${proxy.httpsHost ?? '?'}:${proxy.httpsPort ?? '?'}`,
+              `用 \`bx_sysproxy on\` 指到 127.0.0.1:${port}；${quitHint(process.platform)}`
+              + ' CLI/Electron 不一定读 GNOME 设置：必要时再给那个进程设 http_proxy/https_proxy。',
+            )
+          }
+        }
       } else {
-        const httpEnabled = /HTTPEnable\s*:\s*(\d)/u.exec(scutil.stdout)?.[1]
-        const httpsEnabled = /HTTPSEnable\s*:\s*(\d)/u.exec(scutil.stdout)?.[1]
-        const server = /HTTPSProxy\s*:\s*(\S+)/u.exec(scutil.stdout)?.[1] ?? '(none)'
-        const enabled = httpEnabled === '1' || httpsEnabled === '1'
-        if (enabled) lines.push(`ok   ⑤ 系统代理 Enabled（HTTP=${httpEnabled}, HTTPS=${httpsEnabled}, Server=${server}）`)
-        else lines.push(`FAIL ⑤ 系统代理没开：Enabled 字段是 HTTP=${httpEnabled ?? '?'}/HTTPS=${httpsEnabled ?? '?'}（注意 Server 字段可能是残留的 ${server}，**它不代表生效**）`)
-        if (!enabled) lines.push('     next: `bx_sysproxy on` 之后 **⌘Q 那个客户端再开**（WeChatAppEx 只在启动时读系统代理）。')
+        lines.push(`info ⑤ 这个平台（${process.platform}）没有实现系统代理检查`)
       }
 
       const rules = state?.rules ?? join(root, '.fly-blackbox', 'rules.json')
@@ -1857,7 +1989,7 @@ export function apply(ctx) {
   // ── bx_sysproxy ──────────────────────────────────────────────────────────
   ctx.tools.register(defineTool({
     name: 'bx_sysproxy',
-    description: 'Inspect/point the macOS system proxy at the local interception proxy (on/off need FLY_ALLOW_INTERCEPT=1; always prints the one command that restores it).',
+    description: 'Inspect/point the system proxy at the local interception proxy (macOS: networksetup/scutil; Linux: GNOME gsettings). on/off need FLY_ALLOW_INTERCEPT=1; always prints the one command that restores it.',
     parameters: {
       action: { type: 'string', required: true, description: 'status | on | off' },
       port: { type: 'number', description: 'proxy port, default FLY_PROXY_PORT or 8080' },
@@ -1865,8 +1997,47 @@ export function apply(ctx) {
     output: stringOutput,
     async execute(args, exec) {
       const action = String(args.action ?? '')
-      const state = readState(workspaceRoot(exec))
+      const state = readState(workspaceRoot(exec, ctx))
       const port = args.port ?? state?.port ?? Number(process.env.FLY_PROXY_PORT ?? 8080)
+
+      if (process.platform === 'linux') {
+        const proxy = await gnomeProxyStatus(shell, exec)
+        if (!proxy.available) {
+          throw new Error(
+            `Linux 系统代理：${proxy.reason}。\n`
+            + '本包只实现了 GNOME（gsettings）系统代理；KDE 等桌面请改桌面设置，或给目标进程设 http_proxy/https_proxy。',
+          )
+        }
+        const restore = gnomeProxyRestoreCommand()
+        const envLine = ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']
+          .filter(name => typeof process.env[name] === 'string' && process.env[name].trim() !== '')
+          .map(name => `${name}=${process.env[name]}`)
+        if (action === 'status') {
+          return [
+            `系统代理后端：${proxy.backend}`,
+            `mode=${proxy.mode ?? '(读不到)'} · http=${proxy.httpHost ?? '?'}:${proxy.httpPort ?? '?'} · https=${proxy.httpsHost ?? '?'}:${proxy.httpsPort ?? '?'}`,
+            envLine.length === 0 ? '宿主环境变量：没有 http_proxy/https_proxy（CLI 不一定读 GNOME 设置）' : `宿主环境变量：${envLine.join(' · ')}`,
+            `还原命令（一条）：${restore}`,
+          ].join('\n')
+        }
+        if (action !== 'on' && action !== 'off') return `unparsable action ${JSON.stringify(action)} — 只能是 status / on / off`
+        const commands = action === 'on' ? gnomeProxyOnCommands(port) : gnomeProxyOffCommands()
+        for (const argv of commands) requireOk(await runCmd(shell, argv, exec, { timeoutMs: 30_000 }), argv.join(' '))
+        const after = await gnomeProxyStatus(shell, exec)
+        return [
+          action === 'on'
+            ? `已把 GNOME 系统代理指向 127.0.0.1:${port}（http + https）`
+            : '已关掉 GNOME 系统代理（mode=none）',
+          `随手核对：mode=${after.mode ?? '(读不到)'} · http=${after.httpHost ?? '?'}:${after.httpPort ?? '?'} · https=${after.httpsHost ?? '?'}:${after.httpsPort ?? '?'}`,
+          `还原命令（一条，随时可复制）：${restore}`,
+          action === 'on' ? `下一步：${quitHint('linux')}然后 bx_doctor。` : '',
+          '',
+          '注意：GNOME 设置只影响读它的应用（GNOME 组件 / 部分 Chromium）；终端与很多 CLI 认 http_proxy/https_proxy，不认 gsettings。',
+        ].filter(Boolean).join('\n')
+      }
+      if (process.platform !== 'darwin') {
+        throw new Error(`bx_sysproxy 只实现了 macOS（networksetup/scutil）与 Linux（GNOME gsettings）—— 当前平台 ${process.platform}。`)
+      }
 
       const route = await runCmd(shell, ['sh', '-c', "route -n get default 2>/dev/null | awk '/interface:/{print $2}'"], exec, { timeoutMs: 20_000 })
       const iface = route.stdout.trim()
@@ -1915,7 +2086,7 @@ export function apply(ctx) {
         line,
         `随手核对的 Enabled 字段：${/HTTPEnable\s*:\s*\d/u.exec(after.stdout)?.[0] ?? '(读不到)'} · ${/HTTPSEnable\s*:\s*\d/u.exec(after.stdout)?.[0] ?? '(读不到)'}`,
         `还原命令（一条，随时可复制）：${restore}`,
-        action === 'on' ? '下一步：改完系统代理要 **⌘Q 那个客户端再开**（WeChatAppEx 只在启动时读系统代理），然后 `bx_doctor`。' : '',
+        action === 'on' ? `下一步：${quitHint('darwin')}然后 bx_doctor。` : '',
       ].filter(Boolean).join('\n')
     },
   }))
@@ -1923,61 +2094,84 @@ export function apply(ctx) {
   // ── bx_ca ────────────────────────────────────────────────────────────────
   ctx.tools.register(defineTool({
     name: 'bx_ca',
-    description: 'Inspect the mitm CA trust state and print (never run) the command a human must execute; verify afterwards with security verify-cert. Never escalates privileges.',
+    description: 'Inspect the mitm CA trust state and print (never run) the command a human must execute; verify afterwards with security verify-cert (macOS) or openssl verify (Linux). Never escalates privileges.',
     parameters: {
       action: { type: 'string', required: true, description: 'status | command | verify' },
     },
     output: stringOutput,
     async execute(args, exec) {
-      const root = workspaceRoot(exec)
+      const root = workspaceRoot(exec, ctx)
       const state = readState(root)
       const confdir = state?.confdir ?? join(root, '.fly-blackbox', 'mitmproxy')
       const caPem = join(confdir, 'mitmproxy-ca-cert.pem')
       const action = String(args.action ?? '')
+      const platform = process.platform
 
       const fingerprint = await runCmd(shell, ['openssl', 'x509', '-in', caPem, '-noout', '-sha256', '-fingerprint'], exec, { timeoutMs: 20_000 })
       if (fingerprint.exitCode !== 0) {
+        if (fingerprint.exitCode === 127 || /not found/iu.test(fingerprint.stderr)) {
+          return [
+            '读不到 mitm CA 的指纹：本机没有 openssl（Ubuntu：sudo apt install openssl）。',
+            `CA 路径（文件本身可能已在）：${caPem}`,
+            '装好 openssl 后重试；也可以手跑 `openssl x509 -in <CA> -noout -fingerprint -sha256` 核对。',
+          ].join('\n')
+        }
         return [
           `读不到 mitm CA：${caPem}`,
           'CA 由 mitmdump 首次启动时生成 —— 先 `bx_proxy start`（它会回显 confdir 绝对路径），再回来。',
         ].join('\n')
       }
       const fp = fingerprint.stdout.trim().split('\n').map(l => l.trim()).filter(Boolean).join(' | ')
-      const trust = await runCmd(shell, ['security', 'verify-cert', '-c', caPem], exec, { timeoutMs: 30_000 })
+      // 校验命令按平台分派：macOS 用 security，Linux 用 `openssl verify -CAfile <系统 bundle>`。
+      const verifyArgv = caVerifyArgv(platform, caPem)
+      const verifyText = verifyArgv.join(' ')
+      const trust = await runCmd(shell, verifyArgv, exec, { timeoutMs: 30_000 })
       const trusted = trust.exitCode === 0
       const trustLine = trusted
-        ? `可信：security verify-cert -c ${caPem} 退出 0`
-        : `不可信：security verify-cert -c ${caPem} 退出 ${trust.exitCode} —— ${trust.stderr.trim().split('\n').slice(-2).join(' | ')}`
+        ? `可信：${verifyText} 退出 0`
+        : `不可信：${verifyText} 退出 ${trust.exitCode} —— ${trust.stderr.trim().split('\n').slice(-2).join(' | ')}`
+          + (trust.exitCode === 127 ? '（openssl 不在本机：sudo apt install openssl）' : '')
 
       if (action === 'status') {
         return [
           `CA: ${caPem}`,
           `指纹: ${fp}`,
           trustLine,
+          caTrustNote(platform),
           trusted ? '' : '\n要人跑的那条命令用 `bx_ca command` 取（本包**永不提权**，所以不经接缝执行）。',
         ].filter(Boolean).join('\n')
       }
 
       if (action === 'command') {
-        // 这条带 `sudo` 的命令是**给人复制的文本**，不经过接缝。理由见文件头纪律三。
-        return [
-          '# 下面这条命令要你自己在终端跑（本包永不提权：沙箱里提权调用弹不出框、也没有超时，真会话会挂住）',
-          `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${caPem}`,
-          '',
-          `# 只用当前用户（不需要 sudo，但只对当前用户生效）：`,
-          `security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db ${caPem}`,
-          '',
-          `# 跑完用 bx_ca verify 取事后证据（security verify-cert 的退出码 + 指纹）。`,
-          `# 还原：sudo security delete-certificate -c "mitmproxy" /Library/Keychains/System.keychain`,
-        ].join('\n')
+        // 带 `sudo` 的命令是**给人复制的文本**，不经过接缝。理由见文件头纪律三。
+        if (platform === 'darwin') {
+          return [
+            '# 下面这条命令要你自己在终端跑（本包永不提权：沙箱里提权调用弹不出框、也没有超时，真会话会挂住）',
+            `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ${caPem}`,
+            '',
+            `# 只用当前用户（不需要 sudo，但只对当前用户生效）：`,
+            `security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db ${caPem}`,
+            '',
+            `# 跑完用 bx_ca verify 取事后证据（security verify-cert 的退出码 + 指纹）。`,
+            `# 还原：sudo security delete-certificate -c "mitmproxy" /Library/Keychains/System.keychain`,
+          ].join('\n')
+        }
+        if (platform === 'linux') {
+          return [
+            '# 下面的命令要你自己在终端跑（本包永不提权：沙箱里提权调用弹不出框、也没有超时，真会话会挂住）',
+            ...caInstallLines(caPem),
+          ].join('\n')
+        }
+        throw new Error(`bx_ca 只实现了 macOS 与 Linux 的信任安装指引 —— 当前平台 ${platform}。`)
       }
 
       if (action === 'verify') {
         return [
-          `证据：security verify-cert -c ${caPem} → ${trusted ? '退出 0（可信）' : `退出 ${trust.exitCode}（仍不可信）`}`,
+          `证据：${verifyText} → ${trusted ? '退出 0（可信）' : `退出 ${trust.exitCode}（仍不可信）`}`,
           `指纹（应与上面的命令装的是同一张）：${fp}`,
           trust.stderr.trim() === '' ? '' : `stderr: ${trust.stderr.trim().split('\n').slice(-2).join(' | ')}`,
           '',
+          caTrustNote(platform),
           `提示：装完 CA 后目标客户端要**重启**才会读新的信任设置（小程序宿主尤其如此）。`,
         ].filter(Boolean).join('\n')
       }
@@ -1999,7 +2193,7 @@ export function apply(ctx) {
     },
     output: stringOutput,
     async execute(args, exec) {
-      const root = workspaceRoot(exec)
+      const root = workspaceRoot(exec, ctx)
       const state = readState(root)
       const action = String(args.action ?? '')
       const dump = safePath(args.path ?? state?.dump ?? join(root, '.fly-blackbox', 'flows.mitm'))

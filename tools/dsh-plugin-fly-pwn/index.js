@@ -462,12 +462,21 @@ async function canaryFromStrings(shell, path, exec, why) {
  * strategy. Asserted in scripts/verify-security-tools.mjs against ELF32/ELF64,
  * ET_EXEC/ET_DYN (with and without PT_INTERP), DT_HASH and DT_GNU_HASH fixtures.
  */
+/**
+ * checksec 的安装包按平台给：macOS 是 `brew install checksec`，Ubuntu 是
+ * `sudo apt install checksec`。原先写死 Homebrew，在 Ubuntu 上照抄会得到
+ * "没有 brew" —— 一个不影响读数、但会把人带错的指引。
+ */
+function checksecInstallHint() {
+  return process.platform === 'darwin' ? 'brew install checksec' : 'sudo apt install checksec'
+}
+
 async function elfMitigationLines(shell, path, exec, kind) {
   const run = rawRun(shell, exec)
   const elf = await elfProbe(run, path)
   const lines = [
     `path=${path}`,
-    'checksec=not installed (install checksec.sh — brew install checksec — for the vendor verdict)',
+    `checksec=not installed (install checksec.sh — ${checksecInstallHint()} — for the vendor verdict)`,
     `format=${kind === '' ? 'unknown (file(1) reported nothing)' : kind}`,
   ]
   if (elf === null) {
@@ -508,7 +517,7 @@ async function elfMitigationLines(shell, path, exec, kind) {
 async function machoMitigationLines(shell, path, exec, kind) {
   const lines = [
     `path=${path}`,
-    'checksec=not installed (install checksec.sh — brew install checksec — for the vendor verdict)',
+    `checksec=not installed (install checksec.sh — ${checksecInstallHint()} — for the vendor verdict)`,
     `format=${kind}`,
   ]
   const otool = await runCmd(shell, ['otool', '-hv', path], exec)
@@ -545,7 +554,7 @@ async function mitigationLines(shell, path, exec) {
   if (kind.startsWith('ELF') || kind === '') return await elfMitigationLines(shell, path, exec, kind)
   return [
     `path=${path}`,
-    'checksec=not installed (install checksec.sh — brew install checksec — for the vendor verdict)',
+    `checksec=not installed (install checksec.sh — ${checksecInstallHint()} — for the vendor verdict)`,
     `format=${kind}`,
     'pie=unknown (neither ELF nor Mach-O — this tool does not guess for other formats)',
   ]

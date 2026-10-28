@@ -5,10 +5,20 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
   blockOf,
   collapseNeighbors,
-  parseNetworkEntry,
+  filterListenerLines,
+  parseIwDev,
+  parseIwLink,
+  parseIwPhyChannels,
+  parseIwReg,
+  parseIwScanNeighbors,
+  parseLinkSample,
+  parseNmcliNeighbors,
   parsePingStats,
+  parseProcNetWireless,
   parseSpeedSample,
   parseWifiReport,
+  pingArgv as pingArgvForPlatform,
+  portableMtimeCommand,
   summarizeChannels,
 } from './wifi.js'
 
@@ -114,7 +124,9 @@ const AIRPORT_ARGV = ['system_profiler', 'SPAirPortDataType']
  * 产生流量 —— 所以结果里必定回传 `totalBytes`，让 agent 和人都知道这次花了多少。
  * 门禁不碰外网：它把 `url` 指向自己起的 127.0.0.1 服务。
  */
-const DEFAULT_SPEED_URL = 'https://registry.npmmirror.com/-/binary/node/v20.11.0/node-v20.11.0-darwin-arm64.tar.gz'
+const DEFAULT_SPEED_URL = process.platform === 'darwin'
+  ? 'https://registry.npmmirror.com/-/binary/node/v20.11.0/node-v20.11.0-darwin-arm64.tar.gz'
+  : 'https://registry.npmmirror.com/-/binary/node/v20.11.0/node-v20.11.0-linux-x64.tar.gz'
 
 /** 只允许这两种 scheme 进 curl。`file:` 会把本地文件读了回显进工具结果。 */
 const ALLOWED_SCHEMES = ['http:', 'https:']
@@ -177,10 +189,21 @@ function clampInteger(value, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.trunc(parsed)))
 }
 
-/** `ping -q` 一条：macOS 的 `-i` 是间隔秒、`-W` 是单包超时(ms)、`-t` 是整轮超时(s)。 */
+/**
+ * `ping -q` 一条。参数按平台分派：macOS 的 `-W` 是毫秒、`-t` 是整轮秒数；
+ * Linux 的 `-W` 是秒、`-w` 是整轮秒数，`-t` 是 TTL（详见 wifi.js 的 `pingArgv`）。
+ */
 function pingArgv(host, count) {
-  const seconds = Math.max(8, Math.ceil(count * 0.4) + 4)
-  return ['ping', '-c', String(count), '-i', '0.2', '-W', '2000', '-t', String(seconds), '-q', host]
+  return pingArgvForPlatform(process.platform, host, count)
+}
+
+/** 读本机默认网关；取不到返回空串（调用方才回退到 192.168.1.1）。 */
+async function defaultGateway(shell, exec) {
+  const command = process.platform === 'darwin'
+    ? "route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}'"
+    : "ip route show default 2>/dev/null | awk '/default via/{print $3; exit}'"
+  const run = await runCmd(shell, ['sh', '-c', command], exec, { timeoutMs: 15_000 })
+  return run.exitCode === 0 ? run.stdout.trim().split('\n')[0].trim() : ''
 }
 
 /** 把 ping 统计拼成一行。无回应时明说「无回应」，绝不写成 0ms。 */
@@ -264,7 +287,7 @@ function readWatch(logText) {
   const complete = samples.filter(sample => sample.complete)
   const rows = complete.map(sample => ({
     epoch: sample.epoch,
-    link: parseNetworkEntry(sample.link),
+    link: parseLinkSample(sample.link.join('\n')),
     gw: parsePingStats(sample.gw.join('\n')),
     wan: parsePingStats(sample.wan.join('\n')),
   }))
@@ -280,9 +303,15 @@ function readWatch(logText) {
 function sampleSnippet(paths, { count, gateway, wan, indent = '', withLink = true }) {
   const body = [`${indent}{`, `${indent}  echo "@@SAMPLE $(date +%s)"`]
   if (withLink) {
+    const linkCommand = process.platform === 'darwin'
+      ? `${shq(AIRPORT_ARGV[0])} ${shq(AIRPORT_ARGV[1])} 2>/dev/null | sed -n '/Current Network Information:/,/Other Local Wi-Fi Networks:/p'`
+      : process.platform === 'linux'
+        // `iw dev` 列出接口，逐个 `iw dev <if> link`；一条命令同时覆盖多网卡。
+        ? `for i in $(iw dev 2>/dev/null | awk '/^[[:space:]]*Interface /{print $2}'); do iw dev "$i" link 2>/dev/null; done`
+        : 'true'
     body.push(
       `${indent}  echo "@@LINK"`,
-      `${indent}  ${shq(AIRPORT_ARGV[0])} ${shq(AIRPORT_ARGV[1])} 2>/dev/null | sed -n '/Current Network Information:/,/Other Local Wi-Fi Networks:/p'`,
+      `${indent}  ${linkCommand}`,
     )
   }
   body.push(
@@ -322,8 +351,88 @@ function samplerScript(paths, { interval, count, gateway, wan, linkEvery }) {
   ].join('\n')
 }
 
+/**
+ * Linux 的当前链路：`iw dev <if> link` + `iw reg get` + `/proc/net/wireless` 底噪。
+ *
+ * 没有 `iw`（Ubuntu 需要 `sudo apt install iw`）或没有无线接口时返回 `available:false`
+ * 并给出**可行动的**原因；绝不把「量不到」说成「链路正常」。
+ */
+async function collectLinkLinux(shell, signal) {
+  const dev = await runCmd(shell, ['iw', 'dev'], { signal }, { timeoutMs: 15_000 })
+  if (dev.exitCode !== 0) {
+    return {
+      available: false,
+      platform: 'linux',
+      backend: 'iw',
+      error: `iw dev 失败（exit ${dev.exitCode}）：${dev.stderr.trim().split('\n')[0] ?? 'iw 不在本机'} —— Ubuntu 上先装 iw（sudo apt install iw）。`,
+    }
+  }
+  const interfaces = parseIwDev(dev.stdout)
+  if (interfaces.length === 0) {
+    return {
+      available: false,
+      platform: 'linux',
+      backend: 'iw',
+      interfaces: [],
+      error: 'iw dev 没有列出任何无线接口：本机没有 Wi-Fi 硬件/驱动，或全部被 rfkill 关掉。这不是「链路正常」，是没有数据。',
+    }
+  }
+  const iface = interfaces[0].name
+  const link = await runCmd(shell, ['iw', 'dev', iface, 'link'], { signal }, { timeoutMs: 15_000 })
+  if (link.exitCode !== 0) {
+    return {
+      available: false,
+      platform: 'linux',
+      backend: 'iw',
+      interface: iface,
+      error: `iw dev ${iface} link 失败（exit ${link.exitCode}）：${link.stderr.trim().split('\n')[0] ?? ''}`,
+    }
+  }
+  const wireless = await runCmd(shell, ['cat', '/proc/net/wireless'], { signal }, { timeoutMs: 15_000 })
+  const noiseDbm = wireless.exitCode === 0 ? parseProcNetWireless(wireless.stdout, iface) : null
+  const parsed = parseIwLink(link.stdout, { noiseDbm })
+  if (parsed === null) {
+    return {
+      available: false,
+      platform: 'linux',
+      backend: 'iw',
+      interface: iface,
+      error: `接口 ${iface} 存在，但当前没有关联（iw dev ${iface} link 没有 Connected to）。这是「没连上」，不是「链路正常」。`,
+    }
+  }
+  const reg = await runCmd(shell, ['iw', 'reg', 'get'], { signal }, { timeoutMs: 15_000 })
+  return {
+    available: true,
+    platform: 'linux',
+    backend: 'iw',
+    source: `iw dev ${iface} link`,
+    interface: iface,
+    countryCode: reg.exitCode === 0 ? parseIwReg(reg.stdout) : null,
+    phy: parsed.phy,
+    channel: parsed.channel,
+    band: parsed.band,
+    widthMhz: parsed.widthMhz,
+    rssiDbm: parsed.rssiDbm,
+    noiseDbm: parsed.noiseDbm,
+    snrDb: parsed.snrDb,
+    transmitRateMbps: parsed.transmitRateMbps,
+    mcs: parsed.mcs,
+    ssid: parsed.ssid,
+    bssid: parsed.bssid,
+    note: 'transmitRateMbps 来自 iw 的 tx bitrate（上行）；noiseDbm 来自 /proc/net/wireless，驱动不报时为 null；rssiDbm / snrDb 为 null 表示没有测量结果，不是 0。',
+  }
+}
+
 /** 采集本机链路。失败或没有 Wi-Fi 时返回 `available:false`，从不抛异常给面板。 */
 async function collectLink(shell, signal) {
+  if (process.platform === 'linux') return collectLinkLinux(shell, signal)
+  if (process.platform !== 'darwin') {
+    return {
+      available: false,
+      platform: process.platform,
+      error: `本包只实现了 macOS 与 Linux 的 Wi-Fi 链路读取（当前平台 ${process.platform}）：没有数据，不是链路正常。`,
+    }
+  }
   const run = await runCmd(shell, AIRPORT_ARGV, { signal }, { timeoutMs: 30000, stdoutMaxBytes: 4194304 })
   if (run.exitCode !== 0) {
     return { available: false, error: `system_profiler 失败（exit ${run.exitCode}）：${run.stderr.trim().split('\n')[0] ?? ''}` }
@@ -334,7 +443,7 @@ async function collectLink(shell, signal) {
     return {
       available: false,
       interfaces: report.interfaces.map(candidate => candidate.name),
-      error: '系统报告里没有「当前网络」：本机没有关联的 Wi-Fi，或这不是 macOS。这不是「链路正常」，是没有数据。',
+      error: '系统报告里没有「当前网络」：本机没有关联的 Wi-Fi。这不是「链路正常」，是没有数据。',
     }
   }
   const link = iface.current
@@ -355,8 +464,117 @@ async function collectLink(shell, signal) {
   }
 }
 
+/**
+ * Linux 的信道占用：`iw phy <phy> info` 给监管允许的信道，
+ * `iw dev <if> scan dump`（有缓存时）或 `nmcli … wifi list --rescan no` 给邻居。
+ *
+ * 两条路都只读**已有**缓存，不触发扫描。nmcli 不报带宽 ⇒ `widthMhz:null`，
+ * 输出里必须说清「未知带宽」而不是当成 20MHz。
+ */
+async function collectChannelsLinux(shell, { rounds = 3, signal } = {}) {
+  const dev = await runCmd(shell, ['iw', 'dev'], { signal }, { timeoutMs: 15_000 })
+  if (dev.exitCode !== 0) {
+    return { available: false, platform: 'linux', error: `iw dev 失败（exit ${dev.exitCode}）：${dev.stderr.trim().split('\n')[0] ?? 'iw 不在本机'} —— 先装 iw（sudo apt install iw）。` }
+  }
+  const interfaces = parseIwDev(dev.stdout)
+  if (interfaces.length === 0) {
+    return { available: false, platform: 'linux', interfaces: [], error: 'iw dev 没有列出任何无线接口：本机没有 Wi-Fi 硬件/驱动，或全部被 rfkill 关掉。这不是「没有邻居」，是没有数据。' }
+  }
+  const iface = interfaces[0]
+  const phyRun = iface.phy === null
+    ? { exitCode: 1, stdout: '' }
+    : await runCmd(shell, ['iw', 'phy', iface.phy, 'info'], { signal }, { timeoutMs: 20_000, stdoutMaxBytes: 4194304 })
+  const listRun = phyRun.exitCode === 0
+    ? phyRun
+    : await runCmd(shell, ['iw', 'list'], { signal }, { timeoutMs: 20_000, stdoutMaxBytes: 4194304 })
+  const supportedChannels = listRun.exitCode === 0 ? parseIwPhyChannels(listRun.stdout) : []
+
+  // 邻居：先读 iw 的扫描缓存（带宽信息最全），读不到再退回 nmcli。
+  let source = null
+  let neighbors = []
+  const scan = await runCmd(shell, ['iw', 'dev', iface.name, 'scan', 'dump'], { signal }, { timeoutMs: 30_000, stdoutMaxBytes: 8388608 })
+  if (scan.exitCode === 0 && /^BSS\s/mu.test(scan.stdout)) {
+    source = 'iw scan dump'
+    neighbors = parseIwScanNeighbors(scan.stdout)
+  } else {
+    for (let round = 0; round < Math.max(1, rounds); round += 1) {
+      const nmcli = await runCmd(
+        shell,
+        ['nmcli', '-t', '-f', 'CHAN,FREQ,SIGNAL', 'dev', 'wifi', 'list', '--rescan', 'no'],
+        { signal },
+        { timeoutMs: 30_000, stdoutMaxBytes: 4194304 },
+      )
+      if (nmcli.exitCode !== 0) {
+        return {
+          available: false,
+          platform: 'linux',
+          interface: iface.name,
+          error: `iw scan dump 与 nmcli 都读不到邻居（iw exit ${scan.exitCode}；nmcli exit ${nmcli.exitCode}）。`
+            + '这不是「没有邻居」：检查是否装了 iw / NetworkManager，或先用 `iw dev ' + iface.name + ' scan dump` 手工确认权限。',
+        }
+      }
+      source = 'nmcli'
+      neighbors.push(...parseNmcliNeighbors(nmcli.stdout))
+    }
+  }
+
+  const current = source === 'iw scan dump'
+    ? parseIwLink((await runCmd(shell, ['iw', 'dev', iface.name, 'link'], { signal }, { timeoutMs: 15_000 })).stdout)
+    : null
+  const report = {
+    interfaces: [{
+      name: iface.name,
+      status: null,
+      countryCode: null,
+      phyModes: [],
+      supportedChannels,
+      current,
+      neighbors,
+    }],
+  }
+  const plan = summarizeChannels(report)
+  const collapsed = collapseNeighbors(neighbors)
+  const widthKnown = source === 'iw scan dump'
+  return {
+    available: true,
+    platform: 'linux',
+    backend: source,
+    rounds,
+    interfaceName: plan.interfaceName,
+    permittedChannels: plan.permittedChannels,
+    permittedKnown: supportedChannels.some(entry => entry.band === '5GHz'),
+    widthKnown,
+    blocks: plan.blocks.map(block => ({
+      span: block.span,
+      primary: block.primary,
+      dfs: block.dfs,
+      permitted: block.permitted,
+      occupied: block.occupied,
+      occupants: block.occupants.map(entry => ({
+        channel: entry.channel,
+        widthMhz: entry.widthMhz,
+        bestRssiDbm: entry.bestRssiDbm,
+        samples: entry.samples,
+      })),
+    })),
+    width160: plan.width160,
+    collapsedNeighbors: collapsed.length,
+    note: source === 'nmcli'
+      ? 'Linux（nmcli 回退）：只读 NetworkManager 的现有扫描列表；nmcli 不报带宽 ⇒ widthMhz 为 null（未知，不是 20）。监管允许信道读不到时 permittedKnown=false，permitted 字段不能当结论。'
+      : 'Linux（iw scan dump）：只读系统已有的扫描缓存；不触发扫描、不发探测请求。占用按主信道折叠，同信道多 AP 会折成一行（占用数偏保守）。',
+  }
+}
+
 /** 采集信道占用与可用性。只读系统已缓存的扫描结果，不触发扫描、不发探测请求。 */
 async function collectChannels(shell, { rounds = 3, signal } = {}) {
+  if (process.platform === 'linux') return collectChannelsLinux(shell, { rounds, signal })
+  if (process.platform !== 'darwin') {
+    return {
+      available: false,
+      platform: process.platform,
+      error: `本包只实现了 macOS 与 Linux 的信道读取（当前平台 ${process.platform}）：没有数据，不是「没有邻居」。`,
+    }
+  }
   const neighbors = []
   let report = { interfaces: [] }
   for (let round = 0; round < rounds; round += 1) {
@@ -489,7 +707,8 @@ export function apply(ctx) {
       render: (_a, v) => [{ type: 'text', text: v }],
     },
     async execute(_args, exec) {
-      // 证据形状（规划 §5.1）：三支都产出信封。两条方法（lsof / netstat）与"什么都没读到"都要说清。
+      // 证据形状（规划 §5.1）：三支都产出信封。每条方法（ss / lsof / netstat）与
+      // "成功但 0 条"都要说清 —— 「没量到」不能读成「没有」。
       const envelope = (observed, limitations) => JSON.stringify({
         tool: 'diag_net',
         target: 'this host',
@@ -498,24 +717,49 @@ export function apply(ctx) {
         confidence: 'observed',
         limitations,
       }, null, 2)
+      const report = (method, lines, limitations) => envelope({
+        method,
+        total: lines.length,
+        dump: lines.slice(0, 80).join('\n'),
+        truncated: lines.length > 80,
+      }, limitations)
+
+      if (process.platform === 'linux') {
+        // Linux 优先 `ss -ltnp`：`netstat -an` 会把 unix socket 也写成 LISTENING，
+        // 旧过滤只看 LISTEN 会把 80 行全给 unix socket（TCP 监听一条都露不出来）。
+        const ss = await runCmd(shell, ['ss', '-ltnp'], exec, { timeoutMs: 20_000 })
+        if (ss.exitCode === 0) {
+          return report('ss -ltnp', filterListenerLines('linux', ss.stdout), [
+            'ss 的输出原样返回（截断到 80 行；truncated=true 表示后面还有）。进程名/PID 只有内核允许时才出现，看不到 ≠ 没有',
+            '这是**一次快照**：不说明套接字的历史，也不说明谁在连它',
+          ])
+        }
+        const netstat = await runCmd(shell, ['netstat', '-ltnp'], exec, { timeoutMs: 20_000 })
+        if (netstat.exitCode === 0) {
+          return report('netstat -ltnp', filterListenerLines('linux', netstat.stdout), [
+            'ss 不在本机，这份读数是 netstat -ltnp（只含 TCP）；netstat 的表更粗，进程名/PID 可能缺',
+            '这是**一次快照**：不说明套接字的历史，也不说明谁在连它',
+          ])
+        }
+        // 两条都跑不动：大声报错，不返回空表。
+        requireOk(netstat, 'netstat -ltnp')
+      }
+
       const lsof = await runCmd(shell, ['lsof', '-nP', '-iTCP', '-sTCP:LISTEN'], exec)
       if (lsof.exitCode === 0) {
-        return envelope({ method: 'lsof', dump: lsof.stdout.slice(0, 8000), truncated: lsof.stdout.length > 8000 }, [
-          'lsof 的输出原样返回（截断到 8000 字符；truncated=true 表示后面还有没给出来的内容）',
+        return report('lsof', lsof.stdout.split('\n').map(line => line.trim()).filter(Boolean), [
+          'lsof 的输出原样返回（截断到 80 行；truncated=true 表示后面还有没给出来的内容）',
           '这是**一次快照**：不说明套接字的历史，也不说明谁在连它',
         ])
       }
-      const listeners = requireOk(await runCmd(shell, ['netstat', '-an'], exec), 'netstat -an')
-        .split('\n').filter((l) => l.includes('LISTEN')).slice(0, 80)
-      if (listeners.length > 0) {
-        return envelope({ method: 'netstat', dump: listeners.join('\n'), truncated: true }, [
-          'lsof 没跑通，这份读数是 netstat -an 里含 LISTEN 的行（只取前 80 行）',
+      const netstat = await runCmd(shell, ['netstat', '-an'], exec, { timeoutMs: 20_000 })
+      if (netstat.exitCode === 0) {
+        return report('netstat -an', filterListenerLines(process.platform, netstat.stdout), [
+          'lsof 没跑通，这份读数是 netstat -an 里含 LISTEN 的 TCP 行（unix socket 已被排除）',
           'netstat 的表格比 lsof 粗：没有进程名/PID，只说「有东西在这个地址上听」',
         ])
       }
-      return envelope({ method: null, dump: '' }, [
-        'lsof 与 netstat 都没有给出 LISTEN 行 —— 这句话的前提是**两条命令都真的跑过了**；否则「没量到」会被读成「没有」',
-      ])
+      requireOk(netstat, 'netstat -an')
     },
   }))
 
@@ -523,7 +767,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'diag_wifi_link',
-    description: '本机 Wi-Fi 链路快照：PHY 模式、主信道、带宽、RSSI/底噪/SNR、协商速率、MCS。被动读系统报告，不发任何包。',
+    description: '本机 Wi-Fi 链路快照：PHY 模式、主信道、带宽、RSSI/底噪/SNR、协商速率、MCS。macOS 读 system_profiler；Linux 读 iw dev link + /proc/net/wireless，不发任何包。',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(_args, exec) {
@@ -539,7 +783,7 @@ export function apply(ctx) {
         confidence: 'observed',
         limitations: [
           '一次采样：只说"这一刻"的取值，不说明它稳不稳（要历史用 diag_net_watch 记）',
-          '被动读系统报告：不主动发探测、不连接任何东西，因此看不到对端或邻居的行为',
+          '被动读系统数据源（macOS system_profiler / Linux iw 与 /proc）：不主动发探测、不连接任何东西，因此看不到对端或邻居的行为',
         ],
       }, null, 2)
     },
@@ -547,7 +791,7 @@ export function apply(ctx) {
 
   ctx.tools.register(defineTool({
     name: 'diag_wifi_channels',
-    description: '5GHz 信道占用图与可用性：邻居按（频段/带宽/主信道）折叠，并算出哪些 80MHz 块被允许、160MHz 是否可能。只读系统扫描缓存，不发探测请求、不连接任何东西。',
+    description: '5GHz 信道占用图与可用性：邻居按（频段/带宽/主信道）折叠，并算出哪些 80MHz 块被允许、160MHz 是否可能。macOS 读 system_profiler；Linux 读 iw scan dump / nmcli 的只读扫描缓存，不发探测请求。',
     parameters: {
       rounds: { type: 'number', description: '读缓存的轮数（默认 3，上限 8）。缓存要几轮才收敛，一轮会漏报。' },
     },
@@ -564,7 +808,7 @@ export function apply(ctx) {
         observed: snapshot,
         confidence: 'observed',
         limitations: [
-          '读的是系统扫描缓存：缓存要几轮才收敛，一轮会漏报（本包默认读 3 轮）',
+          '读的是系统扫描缓存：macOS 的 system_profiler 要几轮才收敛（默认读 3 轮）；Linux 的 iw scan dump 只读一次缓存，nmcli 回退按 rounds 读',
           '只读缓存，不发探测请求、不连接任何东西 —— 因此看不到两次采样之间的变化',
         ],
       }, null, 2)
@@ -575,13 +819,16 @@ export function apply(ctx) {
     name: 'diag_net_rtt',
     description: '同时测局域网网关与外网的 RTT/丢包/抖动 —— 把「空口被抢」和「路由器/运营商排队」分开的第一刀。会发 ICMP 包。',
     parameters: {
-      gateway: { type: 'string', description: '网关地址（默认 192.168.1.1）' },
+      gateway: { type: 'string', description: '网关地址（默认取本机默认网关；取不到才用 192.168.1.1）' },
       wan: { type: 'string', description: '外网目标（默认 223.5.5.5，阿里公共 DNS）' },
       count: { type: 'number', description: '每个目标发几个包（默认 20，上限 60）' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     async execute(args, exec) {
-      const gateway = requireHost(args.gateway, '192.168.1.1')
+      const detectedGateway = args.gateway === undefined || String(args.gateway).trim() === ''
+        ? await defaultGateway(shell, exec)
+        : ''
+      const gateway = requireHost(args.gateway, detectedGateway === '' ? '192.168.1.1' : detectedGateway)
       const wanTarget = requireHost(args.wan, '223.5.5.5')
       const count = clampInteger(args.count, 20, 4, 60)
 
@@ -711,7 +958,7 @@ export function apply(ctx) {
       message: { type: 'string', description: 'mark 时的备注，例如「电视卡了」' },
       interval: { type: 'number', description: '采样间隔秒（默认 10，下限 3，上限 600）' },
       count: { type: 'number', description: '每次采样每个目标发几个包（默认 8，上限 30）' },
-      gateway: { type: 'string', description: '网关地址（默认 192.168.1.1）' },
+      gateway: { type: 'string', description: '网关地址（默认取本机默认网关；取不到才用 192.168.1.1）' },
       wan: { type: 'string', description: '外网目标（默认 223.5.5.5）' },
       samples: { type: 'number', description: 'report 最多回看多少个样本（默认 300，上限 5000）' },
     },
@@ -720,7 +967,10 @@ export function apply(ctx) {
       // undefined 必须保持 undefined（否则默认目录就没了）：只规范化"给了且以 - 开头"的那种。
       const paths = watchPaths(args.dir === undefined ? undefined : safePath(args.dir))
       const action = String(args.action ?? 'status').trim() === '' ? 'status' : String(args.action).trim()
-      const gateway = requireHost(args.gateway, '192.168.1.1')
+      const detectedGateway = args.gateway === undefined || String(args.gateway).trim() === ''
+        ? await defaultGateway(shell, exec)
+        : ''
+      const gateway = requireHost(args.gateway, detectedGateway === '' ? '192.168.1.1' : detectedGateway)
       const wan = requireHost(args.wan, '223.5.5.5')
       const count = clampInteger(args.count, 8, 4, 30)
       // 证据形状（规划 §5.1）：逐支迁移 —— 本轮只把 status 支包上（没有消费方读它的裸文本）。
@@ -921,8 +1171,15 @@ export function apply(ctx) {
         'if [ -f "$d/stop" ]; then echo "停止信号: 存在（下次 start 会清掉）"; fi',
         'if [ -f "$d/samples.log" ]; then',
         '  echo "样本: $(grep -c \'^@@SAMPLE\' "$d/samples.log") 个；标记: $(grep -c \'^@@MARK\' "$d/samples.log") 个"',
-        '  age=$(( $(date +%s) - $(stat -f %m "$d/samples.log" 2>/dev/null || echo 0) ))',
-        '  echo "日志: $d/samples.log（$(wc -c < "$d/samples.log" | tr -d \' \') 字节，最后写入 ${age}s 前）"',
+        // GNU stat（-c %Y）优先、BSD stat（-f %m）兜底：直接用 -f 在 Linux 上会把文件系统表
+        // 塞进 $(( ))，在 dash 里就是语法错误 —— 整个 status 的后半段都不执行。
+        `  mtime=$( ${portableMtimeCommand('"$d/samples.log"')} )`,
+        '  case "$mtime" in ""|*[!0-9]*) mtime=0 ;; esac',
+        '  if [ "$mtime" -gt 0 ]; then',
+        '    echo "日志: $d/samples.log（$(wc -c < "$d/samples.log" | tr -d \' \') 字节，最后写入 $(( $(date +%s) - mtime ))s 前）"',
+        '  else',
+        '    echo "日志: $d/samples.log（$(wc -c < "$d/samples.log" | tr -d \' \') 字节，mtime 读不到 —— 无法说最后写入）"',
+        '  fi',
         'else',
         '  echo "还没有日志文件"',
         'fi',
