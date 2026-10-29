@@ -107,8 +107,32 @@ function requireOk(run, what) {
 // 坑三（本次实测）：`os/mac_arm_64/decompile does not exist` ⇒ **反编译的原生件没编译**，
 // 这条能力要先跑 `support/buildNatives`（要 C++ 工具链）才有；在此之前只有 import/分析/函数表。
 
-/** arm64 macOS 上唯一实测可用的 JDK（doctor 会把这条写进结果）。 */
-const GHIDRA_JAVA_HOME = '/opt/homebrew/opt/openjdk@26'
+/**
+ * arm64 macOS 上唯一实测可用的 JDK（Homebrew）。
+ *
+ * Linux 上不猜这个路径：优先 `GHIDRA_JAVA_HOME` / `JAVA_HOME`，否则从 `command -v java`
+ * 反解出 JDK 根（见 `resolveJavaHome`）。`analyzeHeadless` 自己不读 `java` 的 PATH，
+ * 所以拿到空值时要**不设** JAVA_HOME（让它走自带/系统默认），而不是设成空串。
+ */
+const GHIDRA_JAVA_HOME_DARWIN = '/opt/homebrew/opt/openjdk@26'
+
+/** 命令里的 `JAVA_HOME=…` 前缀；空值 → 不设（不是设成空串）。 */
+function javaHomePrefix(javaHome) {
+  return javaHome === '' ? '' : 'JAVA_HOME=' + shq(javaHome) + ' '
+}
+
+/**
+ * Ghidra 启动前缀：把 `user.home` 指到**工作目录下**，不要写宿主的 `~/.config/ghidra`。
+ *
+ * DSH 的 shell 跑在 workspace-write 沙箱里：`~/.config` 不可写，Ghidra 会在启动时
+ * `Failed to create directory: /home/…/.config/ghidra/...`，然后（无 TTY）转成
+ * "Unable to prompt user for JDK path" —— 看起来像 JDK 问题，实际是配置目录不可写。
+ * 实测 Ubuntu：`JAVA_TOOL_OPTIONS=-Duser.home=<work>/home` 后 headless 正常。
+ */
+function ghidraEnvPrefix(javaHome, work) {
+  const settings = `${work}/home`
+  return `mkdir -p ${shq(settings)} && ${javaHomePrefix(javaHome)}JAVA_TOOL_OPTIONS=${shq(`-Duser.home=${settings}`)} `
+}
 
 /** `-postScript` 里那个脚本：把函数表打成 `FLYFN ` 前缀的 JSON 行（脚本在 scratch 里现写）。 */
 function flyFunctionsScript() {
@@ -255,7 +279,7 @@ async function runGhidraPostScript(shell, exec, { headless, javaHome, work, bina
   await runCmd(shell, ['mkdir', '-p', work], exec, { timeoutMs: 10_000 })
   await writeViaBase64(shell, exec, work + '/' + scriptName + '.java', scriptText)
   const run = await runCmd(shell, ['sh', '-c', [
-    'JAVA_HOME=' + javaHome + ' ' + shq(headless) + ' ' + shq(work) + ' flyproj',
+    ghidraEnvPrefix(javaHome, work) + shq(headless) + ' ' + shq(work) + ' flyproj',
     '-import ' + shq(binary) + ' -deleteProject',
     '-scriptPath ' + shq(work) + ' -postScript ' + scriptName + (arg === undefined || arg === '' ? ''
       : ' ' + (Array.isArray(arg) ? arg.map(item => shq(String(item))).join(' ') : shq(arg))),
@@ -462,8 +486,68 @@ function flyDecompileMultiScript() {
 }
 
 
+/**
+ * 找 analyzeHeadless：显式 GHIDRA_HOME → PATH 里的 analyzeHeadless → 常见安装目录。
+ *
+ * macOS 的 `~/tools/ghidra_*` 仍保留；Linux 加 `/opt/ghidra*`、`/usr/share/ghidra*`、
+ * `/usr/local/ghidra*`。**不靠"装了吗"的猜测**：每一支都要求文件真的可执行。
+ */
 function ghidraHeadless(shell, exec) {
-  return runCmd(shell, ['sh', '-c', 'if [ -n "$GHIDRA_HOME" ]; then echo "$GHIDRA_HOME/support/analyzeHeadless"; else ls -d "$HOME"/tools/ghidra_*/support/analyzeHeadless 2>/dev/null | sort | tail -1; fi'], exec, { timeoutMs: 10_000 })
+  const script = [
+    'if [ -n "$GHIDRA_HOME" ] && [ -x "$GHIDRA_HOME/support/analyzeHeadless" ]; then echo "$GHIDRA_HOME/support/analyzeHeadless"; exit 0; fi',
+    'if command -v analyzeHeadless >/dev/null 2>&1; then command -v analyzeHeadless; exit 0; fi',
+    'ls -d "$HOME"/tools/ghidra_*/support/analyzeHeadless /opt/ghidra*/support/analyzeHeadless /usr/share/ghidra*/support/analyzeHeadless /usr/local/ghidra*/support/analyzeHeadless 2>/dev/null | sort | tail -1',
+  ].join('\n')
+  return runCmd(shell, ['sh', '-c', script], exec, { timeoutMs: 10_000 })
+}
+
+/**
+ * 解析 JDK 根：`GHIDRA_JAVA_HOME` → `JAVA_HOME` → 平台默认。
+ *
+ * macOS 先看 Homebrew 的 openjdk@26（实测可用），Linux 从 `command -v java` 的
+ * 真实路径反解（`/usr/lib/jvm/<jdk>/bin/java` → `/usr/lib/jvm/<jdk>`）。
+ * 都找不到就返回空串 —— 调用方不设 JAVA_HOME，而不是设一个不存在的路径。
+ */
+async function resolveJavaHome(shell, exec) {
+  for (const name of ['GHIDRA_JAVA_HOME', 'JAVA_HOME']) {
+    const value = process.env[name]
+    if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  }
+  if (process.platform === 'darwin') {
+    const probe = await runCmd(shell, ['sh', '-c', `[ -x ${shq(GHIDRA_JAVA_HOME_DARWIN + '/bin/java')} ] && echo ${shq(GHIDRA_JAVA_HOME_DARWIN)}`], exec, { timeoutMs: 10_000 })
+    if (probe.exitCode === 0 && probe.stdout.trim() !== '') return probe.stdout.trim().split('\n').at(-1).trim()
+    // macOS 上**不**回退到 /usr/bin/java：那正是 java_home 指向 x86_64 Java 8 的那个坑。
+    return ''
+  }
+  // 持久安装的 JDK（本机 ~/tools/jdk-*）优先于 PATH 的 java：Ubuntu 默认 java 可能还是 11，
+  // 而 Ghidra 12.3 要 25。按版本排序取最高，别让"默认 java"决定 doctor 的结论。
+  const persisted = await runCmd(shell, ['sh', '-c', [
+    'ls -d "$HOME"/tools/jdk-*/bin/java 2>/dev/null | sort -V | tail -1',
+  ].join('\n')], exec, { timeoutMs: 10_000 })
+  const persistedJava = persisted.exitCode === 0 ? persisted.stdout.trim().split('\n').at(-1).trim() : ''
+  if (persistedJava !== '') return persistedJava.replace(/\/bin\/java$/u, '')
+  const probe = await runCmd(shell, ['sh', '-c', [
+    'J=$(command -v java) || exit 0',
+    '[ -n "$J" ] || exit 0',
+    'J=$(readlink -f "$J" 2>/dev/null || echo "$J")',
+    'dirname "$(dirname "$J")"',
+  ].join('\n')], exec, { timeoutMs: 10_000 })
+  return probe.exitCode === 0 ? probe.stdout.trim().split('\n').at(-1).trim() : ''
+}
+
+/**
+ * Ghidra 的项目目录不能含以 `.` 开头的路径段（实测 12.3：`Path element starting with '.' is
+ * not permitted`）。`TMPDIR` 完全可能是 `~/.cache/...` 这种形状，直接用会在 headless 启动时
+ * 报一个与真实原因无关的错。含点段就退到 `/tmp`，别把用户的 TMPDIR 改掉。
+ */
+function ghidraWorkDir() {
+  for (const candidate of [process.env.TMPDIR, '/tmp']) {
+    if (typeof candidate !== 'string' || candidate.trim() === '') continue
+    const dir = candidate.trim().replace(/\/+$/u, '')
+    if (dir.split('/').some(segment => segment.startsWith('.'))) continue
+    return `${dir}/fly-reverse-ghidra`
+  }
+  return '/tmp/fly-reverse-ghidra'
 }
 
 /** JDK 探针直接跑 javaHome 下的 java —— **别**写 `JAVA_HOME=x "$JAVA_HOME/bin/java"`：
@@ -481,13 +565,21 @@ function ghidraFix(text) {
     ].join('\n')
   }
   if (/decompile does not exist|Building Native Components/u.test(text)) {
+    const platformDir = process.platform === 'darwin'
+      ? `mac_${process.arch === 'arm64' ? 'arm_64' : 'x86_64'}`
+      : `linux_${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}`
     return [
-      'Ghidra 的反编译原生件还没编译（os/mac_arm_64/decompile 不存在）——',
+      `Ghidra 的反编译原生件还没编译（os/${platformDir}/decompile 不存在）——`,
       '这只影响**反编译**，import / 分析 / 函数表照旧能用。',
       '修法（要 C++ 工具链，一次性）：',
-      '  cd ~/tools/ghidra_12.1.4_PUBLIC/support/gradle/ && gradle buildNatives   # 或自带 wrapper（需联网）：./gradlew buildNatives',
+      '  cd <你的 ghidra>/support/gradle/ && gradle buildNatives   # 或自带 wrapper（需联网）：./gradlew buildNatives',
       '  # 编完在 <模块>/build/os/<平台>/ 下，**要装进** <模块>/os/<平台>/（release 布局里 Ghidra 找的是后者）：',
-      '  cp Ghidra/Features/Decompiler/build/os/mac_*/decompile Ghidra/Features/Decompiler/os/mac_*/',
+      `  cp Ghidra/Features/Decompiler/build/os/${platformDir}/decompile Ghidra/Features/Decompiler/os/${platformDir}/`,
+      '',
+      process.platform === 'linux'
+        ? '  # Linux 上先确认 JDK 版本：cat <ghidra>/Ghidra/application.properties | grep application.java.min（12.3 = 25）。'
+        + 'Ubuntu 24.04 的 apt 最高是 openjdk-21 ⇒ 12.3 需要另装 JDK 25（如 Temurin）并 export JAVA_HOME=<jdk-25>'
+        : '  # macOS 上 JAVA_HOME 见上面那条 Homebrew 路径',
     ].join('\n')
   }
   return ''
@@ -784,7 +876,7 @@ function machoArchNote(available, choice) {
   // ── rev_ghidra（Ghidra headless：doctor / functions）───────────────
   ctx.tools.register(defineTool({
     name: 'rev_ghidra',
-    description: 'Run Ghidra headless (analyzeHeadless) on a binary. doctor = probe the local install (JAVA_HOME trap, native decompiler); functions = import + analyse and list functions as JSON lines. arm64 macOS needs JAVA_HOME=/opt/homebrew/opt/openjdk@26.',
+    description: 'Run Ghidra headless (analyzeHeadless) on a binary. doctor = probe the local install (Ghidra path, JDK, native decompiler); functions = import + analyse and list functions as JSON lines. Finds GHIDRA_HOME, PATH, ~/tools/ghidra_*, /opt/ghidra*; macOS/Linux.',
     parameters: {
       action: { type: 'string', required: true, description: 'doctor | functions' },
       binary: { type: 'string', description: 'binary to analyse (required for functions)' },
@@ -805,40 +897,63 @@ function machoArchNote(available, choice) {
       const headless = found.stdout.trim().split('\n').filter(Boolean).at(-1) ?? ''
       if (headless === '') {
         const error = new Error([
-          'rev_ghidra：找不到 analyzeHeadless —— 这台机器上 Ghidra 要么没装，要么没装在 ~/tools/ghidra_*/ 下。',
-          '两条路：设 GHIDRA_HOME=<你的 Ghidra 目录>（我只找 $GHIDRA_HOME/support/analyzeHeadless 与 ~/tools/ghidra_*/support/analyzeHeadless），',
-          '或者装一个：https://ghidra-sre.org/ （下载 zip 解压即可，不需要安装器）。',
+          'rev_ghidra：找不到 analyzeHeadless —— 这台机器上 Ghidra 要么没装，要么没在已知位置。',
+          '查找顺序：$GHIDRA_HOME/support/analyzeHeadless → PATH 里的 analyzeHeadless → ~/tools/ghidra_*/、/opt/ghidra*/、/usr/share/ghidra*/。',
+          '或者装一个：https://ghidra-sre.org/ （下载 zip 解压即可；Linux 另需 JDK，版本以 Ghidra 的 application.java.min 为准 —— 12.3 要 25，而 Ubuntu 24.04 的 apt 最高是 openjdk-21）。',
         ].join('\n'))
         error.name = 'ToolError'
         throw error
       }
-      const javaHome = typeof process.env.GHIDRA_JAVA_HOME === 'string' && process.env.GHIDRA_JAVA_HOME.trim() !== ''
-        ? process.env.GHIDRA_JAVA_HOME.trim()
-        : GHIDRA_JAVA_HOME
-      const work = (process.env.TMPDIR || '/tmp').replace(/\/$/u, '') + '/fly-reverse-ghidra'
+      const javaHome = await resolveJavaHome(shell, exec)
+      const work = ghidraWorkDir()
       // 注意：`analyzeHeadless` 是**文件**，`<文件>/../…` 在 POSIX 里解析不了（ENOTDIR）——
-    // 第一版探针就是这么把"装好了"读成"不在"的（手跑同一条命令复现）。要先 `$(dirname …)`。
-    // 平台目录名是 `mac_arm_64`（**有下划线**）：拿 `uname -m` 的 `arm64` 直接拼 `mac_${P}` 会得到
-    // `mac_arm64` ⇒ test -e 恒假，而 ls 明明看得见那个文件 —— 两个读数矛盾就是尺子拼错了。
-    const nativeProbe = headless === '' ? null : await runCmd(shell, ['sh', '-c', 'P=$(uname -m | sed s/arm64/arm_64/); D=$(dirname "' + headless + '"); test -e "$D/../Ghidra/Features/Decompiler/os/mac_${P}/decompile" || test -e "$D/../../os/mac_${P}/decompile"'], exec, { timeoutMs: 10_000 })
-      const javaRun = await runCmd(shell, ['sh', '-c', shq(javaHome + '/bin/java') + ' -version'], exec, { timeoutMs: 15_000 })
+      // 第一版探针就是这么把"装好了"读成"不在"的（手跑同一条命令复现）。要先 `$(dirname …)`。
+      // 平台目录名：macOS 是 `mac_arm_64`（**有下划线**）/ `mac_x86_64`；Linux 是 `linux_x86_64` /
+      // `linux_aarch64`。拿 `uname -m` 的 `arm64` 直接拼会得到 `mac_arm64` ⇒ test -e 恒假。
+      const nativeOs = process.platform === 'darwin'
+        ? `mac_${process.arch === 'arm64' ? 'arm_64' : 'x86_64'}`
+        : `linux_${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}`
+      const nativeProbe = headless === '' ? null : await runCmd(shell, ['sh', '-c', [
+        `D=$(dirname ${shq(headless)})`,
+        `test -e "$D/../Ghidra/Features/Decompiler/os/${nativeOs}/decompile" || test -e "$D/../../os/${nativeOs}/decompile"`,
+      ].join('\n')], exec, { timeoutMs: 10_000 })
+      const javaBin = javaHome === '' ? 'java' : `${javaHome}/bin/java`
+      const javaRun = await runCmd(shell, [javaBin, '-version'], exec, { timeoutMs: 15_000 })
+      const javaOutput = `${javaRun.stdout}\n${javaRun.stderr}`.trim()
+      const javaVersionLine = javaOutput.split('\n').find(line => /version/iu.test(line)) ?? javaOutput.split('\n')[0] ?? ''
+      const javaMajor = Number(/version\s+"(\d+)/u.exec(javaOutput)?.[1] ?? 0)
+      // Ghidra 的**实际**最低 JDK 写在 <GHIDRA_HOME>/Ghidra/application.properties 的
+      // application.java.min 里（12.3 DEV 是 25，旧版本是 17/21）。写死 17 会把 JDK 21 + Ghidra 12.3
+      // 报成"能用"，真跑时才炸。读不到才退回 17（不把"读不到"当"太旧"）。
+      const javaMinRun = headless === '' ? null : await runCmd(shell, ['sh', '-c', [
+        `sed -n 's/^application\\.java\\.min=//p' "$(dirname ${shq(headless)})/../Ghidra/application.properties" 2>/dev/null | tail -1`,
+      ].join('\n')], exec, { timeoutMs: 10_000 })
+      const javaMin = Number((javaMinRun?.stdout ?? '').trim()) || 17
+      const javaOk = javaRun.exitCode === 0 && (javaMajor === 0 || javaMajor >= javaMin)
       if (action === 'doctor') {
         const probes = []
-        probes.push({ what: 'analyzeHeadless', ok: headless !== '', detail: headless === '' ? '不在 ~/tools/ghidra_*/support/ 下（装了的话设 GHIDRA_HOME）' : headless })
-        probes.push({ what: 'arm64 JDK', ok: javaRun.exitCode === 0, detail: javaRun.stdout.trim().split('\n')[0] ?? javaRun.stderr.trim().split('\n')[0] })
-        probes.push({ what: '反编译原生件 os/mac_arm_64/decompile', ok: nativeProbe !== null && nativeProbe.exitCode === 0, detail: nativeProbe !== null && nativeProbe.exitCode === 0 ? '在' : '不在 —— 反编译不可用，函数表照旧（修法见 limitations）' })
+        probes.push({ what: 'analyzeHeadless', ok: headless !== '', detail: headless === '' ? '不在 GHIDRA_HOME / PATH / ~/tools/ghidra_* / /opt/ghidra* 下' : headless })
+        probes.push({
+          what: 'JDK',
+          ok: javaOk,
+          detail: `${javaHome === '' ? '(JAVA_HOME 未设，用 PATH 的 java)' : javaHome} → ${javaVersionLine === '' ? '(读不到版本)' : javaVersionLine}`
+            + (javaMajor > 0 && javaMajor < javaMin ? `（JDK ${javaMajor} 低于 Ghidra 要求的 ${javaMin}）` : ''),
+        })
+        probes.push({ what: `反编译原生件 os/${nativeOs}/decompile`, ok: nativeProbe !== null && nativeProbe.exitCode === 0, detail: nativeProbe !== null && nativeProbe.exitCode === 0 ? '在' : '不在 —— 反编译不可用，函数表照旧（修法见 limitations）' })
         return JSON.stringify({
           tool: 'rev_ghidra',
           target: headless === '' ? '(未找到 analyzeHeadless)' : headless,
-          operation: '三个探针：analyzeHeadless 在不在 / arm64 JDK 能不能跑 / 反编译原生件在不在',
-          observed: { probes, usable: { functions: headless !== '' && javaRun.exitCode === 0, decompile: nativeProbe !== null && nativeProbe.exitCode === 0 } },
+          operation: '三个探针：analyzeHeadless 在不在 / JDK 能不能跑 / 反编译原生件在不在',
+          observed: { platform: process.platform, javaHome, javaMajor, javaMin, nativeOs, probes, usable: { functions: headless !== '' && javaOk, decompile: nativeProbe !== null && nativeProbe.exitCode === 0 } },
           confidence: 'observed',
           limitations: [
-            'arm64 macOS 上**必须**显式设 JAVA_HOME=/opt/homebrew/opt/openjdk@26：'
-              + '/usr/libexec/java_home 默认指向 JavaAppletPlugin（x86_64 Java 8），arm64 直接 Bad CPU type',
+            process.platform === 'darwin'
+              ? 'arm64 macOS 上**必须**显式设 JAVA_HOME=/opt/homebrew/opt/openjdk@26：/usr/libexec/java_home 默认指向 JavaAppletPlugin（x86_64 Java 8），arm64 直接 Bad CPU type'
+              : `Linux：Ghidra 的 application.java.min 要求 JDK ${javaMin}+（12.3 DEV 实测 25）；\`GHIDRA_JAVA_HOME\` / \`JAVA_HOME\` 优先，否则从 \`command -v java\` 反解。`
+                + `apt 的 openjdk 版本随发行版而定（Ubuntu 24.04 最高 21）——低于 ${javaMin} 就另装（Temurin 等）并设 \`JAVA_HOME\`，不要指望 \`apt install openjdk-${javaMin}-jdk\` 一定存在`,
             'analyzeHeadless 的**项目目录必须已存在**（它不替你建）—— 实测出来的形状',
             '反编译原生件缺失 ≠ "这个包没有反编译"：那是装机器的事，修法在下一条',
-            '修法（反编译，官方 GettingStarted.md §Building Native Components）：cd ~/tools/ghidra_12.1.4_PUBLIC/support/gradle/ && gradle buildNatives   # 或自带 wrapper（需联网）：./gradlew buildNatives',
+            '修法（反编译，官方 GettingStarted.md §Building Native Components）：cd <ghidra>/support/gradle/ && gradle buildNatives   # 或自带 wrapper（需联网）：./gradlew buildNatives',
           ],
         }, null, 2)
       }
@@ -951,7 +1066,7 @@ function machoArchNote(available, choice) {
         await runCmd(shell, ['sh', '-c', 'mkdir -p ' + shq(outDir)], exec, { timeoutMs: 10_000 })
         await writeViaBase64(shell, exec, work + '/FlyDecompileMulti.java', flyDecompileMultiScript())
         const run = await runCmd(shell, ['sh', '-c', [
-          'JAVA_HOME=' + javaHome + ' ' + shq(headless) + ' ' + shq(work) + ' flyproj',
+          ghidraEnvPrefix(javaHome, work) + shq(headless) + ' ' + shq(work) + ' flyproj',
           '-import ' + chosen.map(item => shq(safePath(item))).join(' '),
           '-deleteProject',
           '-scriptPath ' + shq(work) + ' -postScript FlyDecompileMulti '
@@ -1140,7 +1255,7 @@ function machoArchNote(available, choice) {
         await runCmd(shell, ['mkdir', '-p', work], exec, { timeoutMs: 10_000 })
         await writeViaBase64(shell, exec, work + '/FlyDecompile.java', flyDecompileScript())
         const run = await runCmd(shell, ['sh', '-c', [
-          'JAVA_HOME=' + javaHome + ' ' + shq(headless) + ' ' + shq(work) + ' flyproj',
+          ghidraEnvPrefix(javaHome, work) + shq(headless) + ' ' + shq(work) + ' flyproj',
           '-import ' + shq(decBinary) + ' -deleteProject',
           '-scriptPath ' + shq(work) + ' -postScript FlyDecompile ' + shq(want),
         ].join(' ')], exec, { timeoutMs: 240_000, stdoutMaxBytes: 8 * 1024 * 1024 })
@@ -1153,8 +1268,14 @@ function machoArchNote(available, choice) {
         }
         const out = run.stdout
         if (!/FLYCODE-END/u.test(out)) {
-          throw new Error('rev_ghidra decompile：一行伪代码都没产出（退出码却是 0）—— 脚本多半没编译过或原生反编译器没装，'
-            + 'Ghidra 对两种情况都可能只打日志不报错；跑 rev_ghidra doctor 看反编译原生件在不在。')
+          // 过滤到不存在的函数时脚本会正常退出、但没有任何 FLYCODE 块；旧文案把它一律说成
+          // "原生反编译器没装"，在 stripped 二进制上会把人引向错误方向（实测 /bin/ls + function=main）。
+          throw new Error(want === ''
+            ? 'rev_ghidra decompile：一行伪代码都没产出（退出码却是 0）—— 脚本多半没编译过或原生反编译器没装，'
+              + 'Ghidra 对两种情况都可能只打日志不报错；跑 rev_ghidra doctor 看反编译原生件在不在。'
+            : `rev_ghidra decompile：没有产出函数 ${JSON.stringify(want)} 的伪代码 —— 两种可能：`
+              + '① 这个二进制里没有这个名字/地址（stripped 二进制常见，先用 rev_ghidra functions 看清单）；'
+              + '② 原生反编译器没装（跑 rev_ghidra doctor 看 os/<平台>/decompile）。')
         }
         const blocks = []
         const pattern = /FLYFN-NAME (\S+)\r?\nFLYCODE-START\r?\n([\s\S]*?)\r?\nFLYCODE-END/gu
@@ -1183,7 +1304,7 @@ function machoArchNote(available, choice) {
       await runCmd(shell, ['mkdir', '-p', work], exec, { timeoutMs: 10_000 })
       await writeViaBase64(shell, exec, work + '/FlyFunctions.java', flyFunctionsScript())
       const run = await runCmd(shell, ['sh', '-c', [
-        'JAVA_HOME=' + javaHome + ' ' + shq(headless) + ' ' + shq(work) + ' flyproj',
+        ghidraEnvPrefix(javaHome, work) + shq(headless) + ' ' + shq(work) + ' flyproj',
         '-import ' + shq(binary) + ' -deleteProject',
         '-scriptPath ' + shq(work) + ' -postScript FlyFunctions ' + limit,
       ].join(' ')], exec, { timeoutMs: 240_000, stdoutMaxBytes: 4 * 1024 * 1024 })

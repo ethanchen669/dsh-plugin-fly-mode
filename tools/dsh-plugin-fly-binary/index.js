@@ -581,7 +581,7 @@ export function apply(ctx) {
       }
       // 本机没有 GNU readelf ⇒ 下面三支都是**仓库内置解析器**算的，limitations 要说清。
       const native = [
-        '本机没有 GNU readelf（macOS 不带 binutils）⇒ 这份读数是仓库内置原生解析器算的，不是 readelf 的输出',
+        process.platform === 'darwin' ? '本机没有 GNU readelf（macOS 不带 binutils）⇒ 这份读数是仓库内置原生解析器算的，不是 readelf 的输出' : '本机没有 readelf（Ubuntu：sudo apt install binutils）⇒ 这份读数是仓库内置原生解析器算的，不是 readelf 的输出',
         '内置解析器只覆盖本工具声明的字段；readelf 的其它开关（--notes/--relocs 等）它不做',
       ]
       if (mode === 'segments') return envelope({ method: 'native', dump: renderElfSegments(elf) }, native)
@@ -624,7 +624,7 @@ export function apply(ctx) {
         limitations: ok
           ? ['读的是 objdump -h 的表格原文，未解析节标志 / 重定位 / 节内容']
           : [`objdump -h 不在本机或读不了这个文件（exit ${run.exitCode}），observed.dump 因此为空 —— 节表没有被读到`,
-             'macOS 不带 GNU binutils；Mach-O 用 rev_imports (nm -u) 或 rev_disasm (objdump -d)'],
+             process.platform === 'darwin' ? 'macOS 不带 GNU binutils；Mach-O 用 rev_imports (nm -u) 或 rev_disasm (objdump -d)' : '本机没有 objdump（Ubuntu：sudo apt install binutils）；ELF 节表需要 binutils'],
       }, null, 2)
     },
   }))

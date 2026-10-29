@@ -5,6 +5,8 @@
   "main": "index.js",
   "files": [
     "index.js",
+    "platform.js",
+    "workspace.js",
     "assets/client-blackbox/SKILL.md",
     "assets/client-blackbox/reference/playbook.md",
     "assets/client-blackbox/reference/checklist.md",
@@ -17,7 +19,7 @@
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-shell": "^0.2.1-rc.2",
     "@deepseek-ai/dsh-tools": "^0.2.1-rc.2",
-    "@deepseek-ai/dsh-skill": "0.2.1-rc.2"
+    "@deepseek-ai/dsh-skill": "^0.2.1-rc.2"
   },
   "license": "MIT",
   "repository": {

@@ -4,7 +4,8 @@
   "type": "module",
   "main": "index.js",
   "files": [
-    "index.js"
+    "index.js",
+    "platform.js"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",

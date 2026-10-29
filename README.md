@@ -74,6 +74,61 @@ dsh plugin --profile=web add @dsh-fly/dsh-plugin-fly-mode@0.1.3 --registry=https
   并且要把包名加进 `package.json` 的 **`dsh.profile.bundles`** —— 那一条才让它成为一层
   （只写 `dependencies` 是不会生效的）。
 
+## Linux（Ubuntu）支持
+
+2026-10 在 **Ubuntu 24.04 / Linux 6.8（x86_64）** 上逐工具实测并补齐。macOS 仍是主发布平台；
+Linux 侧优先用系统自带的数据源，**拿不到数据时大声报「没有数据」**，绝不把缺命令读成
+「链路正常 / 没有邻居 / 文件不存在」。
+
+| 工具 | Linux 数据源 / 行为 |
+| --- | --- |
+| `diag_host` / `diag_procs` | `uname` / `ps aux`（原本就可移植） |
+| `diag_net` | `ss -ltnp`（缺 `ss` 退 `netstat -ltnp`）；只列 TCP LISTEN，unix socket 不再冒充 listener |
+| `diag_net_rtt` | iputils `ping`：`-W 2`（秒）单包超时、`-w <deadline>` 整轮截止；网关默认从 `ip route` 取 |
+| `diag_net_watch` | 同一套 ping 参数；链路采样改为 `iw dev <if> link`；status 的 mtime 用 GNU `stat -c %Y`（BSD `-f %m` 兜底） |
+| `diag_wifi_link` | `iw dev` + `iw dev <if> link` + `/proc/net/wireless`（底噪）+ `iw reg get`（国家码）；没有无线接口 ⇒ `available:false` |
+| `diag_wifi_channels` | `iw phy <phy> info`（监管允许信道）+ `iw dev <if> scan dump`（只读缓存）；`iw` 读不到时退 `nmcli … wifi list --rescan no`。**nmcli 给不出 dBm**：它的 `SIGNAL` 是 0–100 质量值 ⇒ `rssiDbm` 为 `null`、质量值在 `quality`；带宽未知也是 `null`（不是 20） |
+| `diag_net_throughput` | `curl`；默认目标按平台选（Linux x64 / macOS arm64） |
+| `recon_ports` | `nmap` 缺失时用系统 `nc`：Linux `nc -z -w 1`，**不再传 macOS 的 `-G`**；`nc` 也没有 ⇒ 报错，不返回「全部 no-response」的假表 |
+| `recon_http_fingerprint` | `curl`（原本就可移植） |
+| `bin_*` / `pwn_*` / `rev_disasm` / `rev_imports` / `rev_gadget_scan` | ELF 走 `readelf` / `objdump` / 内置解析器；Mach-O 的 `lipo` / `otool` 分支在 Linux 上自然不触发；缺 binutils 时限制条款写明装法 |
+| `rev_ghidra` | `analyzeHeadless` 查找顺序：`GHIDRA_HOME` → `PATH` → `~/tools/ghidra_*` / `/opt/ghidra*` / `/usr/share/ghidra*`；JDK 从 `GHIDRA_JAVA_HOME` / `JAVA_HOME` → `~/tools/jdk-*` → `command -v java` 反解，**最低版本读 `<GHIDRA_HOME>/Ghidra/application.properties` 的 `application.java.min`**（12.3 DEV = 25），低于它在 doctor 里报红 |
+| `bx_*`（blackbox） | 工作区取 `sessionProjections` 投影 / `header.cwd`（**不拿 defaultDirectory / 宿主 cwd 顶替**）；文件大小用 GNU `stat -c%s`；监听用 `ss -ltnp`（`lsof` 兜底）；CA 用 `openssl verify -CAfile <系统 bundle>` + `update-ca-certificates` 指引；系统代理用 GNOME `gsettings`；mitmdump 自动发现 `~/tools/mitmproxy-venv/bin/mitmdump`（或 `FLY_MITM_BIN` / PATH），缺装时给 Ubuntu 的 venv / pipx 指引 |
+| `artifact_*` | 原本就有 GNU `stat` / `wc -c` / `sha256sum` 兜底 |
+
+安装依赖（按需）：
+
+```bash
+sudo apt install -y iw netcat-openbsd openssl binutils python3-venv   # Wi-Fi / recon / CA / ELF / mitmproxy
+# Ghidra：解压后设 GHIDRA_HOME，或放到 /opt/ghidra*。
+# JDK 以 <Ghidra>/Ghidra/application.properties 的 application.java.min 为准（12.3 = 25）；
+# Ubuntu 24.04 的 apt 最高是 openjdk-21 ⇒ 需要另装 JDK 25（如 Temurin）并设 JAVA_HOME。
+```
+
+工具侧自动发现（都可以用环境变量覆盖）：mitmdump 先看 `FLY_MITM_BIN`，再
+`~/tools/mitmproxy-venv/bin/mitmdump`，最后 PATH；`analyzeHeadless` 与 JDK 的顺序见上表。
+
+已知边界（如实写出来，不当成"支持"）：
+
+- **无线**：本次测试机没有 Wi-Fi 硬件，`iw` / `nmcli` 解析器只有夹具回归，**没有在真实射频上跑过**；
+  没有接口时两个无线工具返回 `available:false`（"没有数据"，不是"链路正常"）。
+- **`/proc/net/wireless` 的底噪**：`0` 与 `-256` 都是"驱动没报"的哨兵 ⇒ 归 `null`，不参与 SNR。
+- **ICMP**：`diag_net_rtt` / `diag_net_watch` 需要 `CAP_NET_RAW`（Ubuntu 的 `ping` 通常带
+  `cap_net_raw`）；在禁 raw socket 的沙箱里会明确报错。
+- **mitmproxy**：用 clone 的 `13.0.0.dev` 建 venv 后实测：`bx_proxy start/status/stop`、
+  HTTP 与 HTTPS 各 200、`bx_doctor` ①–⑤ 全过、`bx_flows` 读真实 dump。仍未验证：真实客户端
+  （微信小程序等）的 pinning 与"只在启动时读系统代理"的完整链路。
+- **Ghidra**：从源码构建 `12.3 DEV`（JDK 25）后实测 doctor / `functions` / `decompile` /
+  `decompile-many` / `strings` / `xrefs` / `trace` 均跑通。仍未验证：反编译质量、超大二进制的耗时。
+- **GNOME 系统代理**：只影响读 `gsettings` 的应用；CLI 多数认 `http_proxy` / `https_proxy`，
+  工具输出里会同时给出宿主环境变量。
+- 授权门不变：`recon_*` 仍需 `FLY_ALLOW_RECON=1`，`bx_proxy` / `bx_sysproxy` 的写动作仍需
+  `FLY_ALLOW_INTERCEPT=1`；Linux 实现没有绕过任何一道门。
+- **门禁的分工**：本仓 `node scripts/verify.mjs` 是纯函数 / 包形状检查，在 Linux 上同样可跑；
+  上表这些解析器的行为断言住在 `dsh-fly` 仓的包内测试（`packages/dsh-plugin-fly-*/tests/`），
+  随包走。`dsh-fly` 的 35 组行为门里仍有 macOS 专用断言（如无线被动性只认
+  `system_profiler`），在 Linux 上待补 —— 这是**已知边界**，不是"已经支持"。
+
 ## 仓库状态（2026-10-11）
 
 - 形状定稿：一条 `- insert:` 声明 + 包内 `tools/`（8 个工具内联，行表用本包子路径引用）+
