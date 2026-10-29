@@ -603,7 +603,7 @@
             name: '@deepseek-ai/dsh-plugin-market/tools'
             disabled: true
           - id: tool-fly-smart
-            name: @dsh-fly/dsh-plugin-fly-smart/tools/index.js
+            name: '@dsh-fly/dsh-plugin-fly-smart/tools/index.js'
             config:
               enabled: true
               maxRework: 5

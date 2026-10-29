@@ -43,6 +43,11 @@ const patch = existsSync(patchPath) ? readFileSync(patchPath, 'utf8') : ''
 
 check('包里声明文件在（dsh.bundle.patch 指得对）', patch.length > 0, patchPath)
 check('声明是 `- insert:` 形式', /^- insert:$/mu.test(patch))
+// YAML 的 plain scalar **不能以 `@` 开头**（`@` 是保留指示符）⇒ `name: @dsh-fly/...` 会让整份
+// patch 解析失败，而失败发生在**消费侧装包时**（`dsh plugin add` 报 overlay 解析失败）。
+// 0.1.19 就是这么发出去的：本仓门禁只比字节、只看行表行数，装包才炸。判据只看 name 行本身。
+const unquotedAt = patch.split('\n').filter(line => /^\s*(?:-\s*)?name:\s*[@`]/u.test(line))
+check('没有未加引号的 `@` 开头 name 行（否则整份 YAML 解析失败）', unquotedAt.length === 0, unquotedAt.slice(0, 3).join(' | '))
 check('声明 id 是 preset-fly', /^ {4}- id: preset-fly$/mu.test(patch))
 check('引擎认的声明行名在多', /^\s+name: '@deepseek-ai\/dsh-agent-preset'$/mu.test(patch))
 /**
