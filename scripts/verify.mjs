@@ -82,7 +82,17 @@ check('不带 Fly 外壳（dsh-plugin-fly-shell）', !JSON.stringify(manifest.de
 // `dsh plugin add` 装） + **fly-smart 单独一个
 // plugin**（本包 dependencies 里唯一的一项，由 npm 装进 profile，行表保持裸名）。
 const INLINED = ['dsh-plugin-fly-binary', 'dsh-plugin-fly-reverse', 'dsh-plugin-fly-pwn', 'dsh-plugin-fly-diag', 'dsh-plugin-fly-recon', 'dsh-plugin-fly-blackbox', 'dsh-plugin-fly-guard']
-check('dependencies 只有 fly-smart 与 engagement 两个（其余 7 个已内联）', JSON.stringify(manifest.dependencies ?? {}) === JSON.stringify({ '@dsh-fly/dsh-plugin-fly-engagement': '^0.1.4', '@dsh-fly/dsh-plugin-fly-smart': '^0.2.0' }))
+// 版本号**也是这条钉子的内容**：依赖范围与"行表按哪个版本测过"必须一起改（0.1.21 起跟到
+// smart 0.3.x / engagement 0.2.0 —— 旧范围会让新版 fly-mode 去装旧 smart，同一 profile 里
+// 出现两份 smart）。
+check(
+  'dependencies 只有 fly-smart 与 engagement 两个（其余 7 个已内联，版本与行表同步钉住）',
+  JSON.stringify(manifest.dependencies ?? {}) === JSON.stringify({
+    '@dsh-fly/dsh-plugin-fly-engagement': '^0.2.0',
+    '@dsh-fly/dsh-plugin-fly-smart': '^0.3.0',
+  }),
+  JSON.stringify(manifest.dependencies ?? {}),
+)
 for (const tool of INLINED) {
   const entry = `tools/${tool}/index.js`
   check(`内联：${entry} 在包里`, existsSync(join(ROOT, entry)))
