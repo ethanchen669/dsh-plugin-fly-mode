@@ -155,6 +155,11 @@ sudo apt install -y iw netcat-openbsd openssl binutils python3-venv   # Wi-Fi / 
 （`^22.23.4 || ^24.22.1 || >=26.12.1`，低版本 npm 只告警、能跑，但 REA 的新工具面没有验证过）。
 首次启动 npx 会把 `rea-agents@6.8.0` 拉进缓存（要网络）；之后离线可用。
 
+**2026-10-30 实测（本机）**：真 `dsh` 启动后，引擎的 `dsh-mcp-client` 拉起 REA 并注册
+**229 个** `mcp__rea__*` 工具；模型发起一次 `tools/call`（`mcp__rea__inspect_analysis_settings`，
+空参数）拿到 REA 的真实返回（`revision=0` + 11 条运行时设置），turn 正常收口。缺 REA 时（命令
+换成不存在的二进制）会话照常起来，只是 `mcp__rea__*` 为 0 个。
+
 **失败形态**：`failOnStartupError: false` —— REA 起不来（没网络 / 没 npx / 版本不对）**不拖垮
 Fly 会话**，症状只是 `mcp__rea__*` 工具缺席。**不要把"工具没了"读成"REA 没这个能力"**。
 `toolCallTimeoutMs: 300000`（5 分钟）：本机实测（npx 已缓存）连接 + 229 个工具同步在 10s 内
