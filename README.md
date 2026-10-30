@@ -129,6 +129,47 @@ sudo apt install -y iw netcat-openbsd openssl binutils python3-venv   # Wi-Fi / 
   随包走。`dsh-fly` 的 35 组行为门里仍有 macOS 专用断言（如无线被动性只认
   `system_profiler`），在 Linux 上待补 —— 这是**已知边界**，不是"已经支持"。
 
+## REA 逆向取证（MCP）—— 2026-10-30 加
+
+安全模式（preset-fly）的行表里多了一行 `mcp-rea`：`@deepseek-ai/dsh-mcp-client` 拉起上游
+**[REA](https://github.com/morluto/rea)**（Reverse Engineer Anything）的 MCP 服务，把它的逆向
+取证工具面挂成 `mcp__rea__*`。**版本钉死 `rea-agents@6.8.0`**（走 npx，不预装）—— REA 约八天
+一个大版本、每版都有 breaking changes，跟 `latest` 会被反复打破；要升版就是改这行的钉子 +
+重发本包，别让消费端的解析结果随上游漂。**标准模式（preset-fly-standard）不带 REA**：那是产品
+决定，不是遗漏。
+
+```yaml
+# 安全模式行表里那一行（生成物，别手改）
+- id: mcp-rea
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: rea
+    transport: stdio
+    command: npx
+    args: ['--yes', 'rea-agents@6.8.0', 'mcp']
+    failOnStartupError: false
+    toolCallTimeoutMs: 300000
+```
+
+**前置**：PATH 里要有 `npx`（终端起的 `dsh` 一定有）；Node 要满足 REA 的 engines
+（`^22.23.4 || ^24.22.1 || >=26.12.1`，低版本 npm 只告警、能跑，但 REA 的新工具面没有验证过）。
+首次启动 npx 会把 `rea-agents@6.8.0` 拉进缓存（要网络）；之后离线可用。
+
+**失败形态**：`failOnStartupError: false` —— REA 起不来（没网络 / 没 npx / 版本不对）**不拖垮
+Fly 会话**，症状只是 `mcp__rea__*` 工具缺席。**不要把"工具没了"读成"REA 没这个能力"**。
+`toolCallTimeoutMs: 300000`（5 分钟）：REA 冷启动实测 36s（小 PE）～64s（6MB DLL）—— 默认 60s
+会在第一次 `open_binary` 上超时。
+
+**与上游自己的注册二选一**：`rea setup --client dsh` 会往 profile 写一行 `serverName: rea`
+—— 同一个 serverName 只许一行（引擎拒后到者）。用了本包的行就别跑 `rea setup`，反之亦然。
+要换自己装的 REA / 自己的启动命令，在 profile 的 `cordis.patch.yml` 里按 `id: mcp-rea`
+**整份 config 替换**（`config` 是整体替换、不是深合并）。
+
+**Windows 未测**（`npx.cmd` 不能被无 shell 的 spawn 直接执行）；macOS / Linux 上这行是
+纯字面量 YAML（一条 `!!js` 都不用），czcdr/dsh-plugin-rea 的三条 YAML 陷阱（裸 `!!js` 标量含
+`? :` 会被读成 mapping、反斜杠路径、拼 `$HOME`）都绕开了；生成器里有守卫，谁再引入裸 `!!js`
+陷阱会在生成时当场红。
+
 ## 仓库状态（2026-10-11）
 
 - 形状定稿：一条 `- insert:` 声明 + 包内 `tools/`（8 个工具内联，行表用本包子路径引用）+

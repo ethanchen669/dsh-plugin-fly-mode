@@ -71,8 +71,21 @@ function presetRowsOf(entryId) {
 }
 const flyBlock = presetRowsOf('preset-fly')
 const standardBlock = presetRowsOf('preset-fly-standard')
-check('安全模式行表齐（46 行 + 声明自身）', flyBlock !== null && flyBlock.filter(line => /^\s+- id: /u.test(line)).length === 47)
+// 2026-10-30 +1：安全模式挂 REA 的 MCP 桥（mcp-rea）⇒ 47 → 48。改行表就要回来改这个登记数。
+check('安全模式行表齐（47 行 + 声明自身）', flyBlock !== null && flyBlock.filter(line => /^\s+- id: /u.test(line)).length === 48)
 check('标准模式行表齐（33 行 + 声明自身）', standardBlock !== null && standardBlock.filter(line => /^\s+- id: /u.test(line)).length === 34)
+// mcp-rea（安全模式挂 REA 的 MCP 桥）：恰好一条、只在安全模式块、name 带引号、钉 6.8.0、
+// 缺 REA 不拖垮会话（failOnStartupError: false）。**标准模式块里必须缺席**——那是产品决定
+// （安全模式才要逆向取证面），漏进标准模式要红。
+const reaLines = (block) => block === null ? [] : block.filter(line => /mcp-rea|dsh-mcp-client|rea-agents@/u.test(line))
+check('mcp-rea 行只在安全模式里（标准模式不带 REA）', reaLines(flyBlock).length > 0 && reaLines(standardBlock).length === 0, `安全模式 ${reaLines(flyBlock).length} 行命中 · 标准模式 ${reaLines(standardBlock).length} 行命中`)
+check('mcp-rea：name 带引号、钉 rea-agents@6.8.0、failOnStartupError: false',
+  flyBlock !== null
+    && flyBlock.some(line => /^\s+name: '@deepseek-ai\/dsh-mcp-client'$/u.test(line))
+    && flyBlock.some(line => line.includes('rea-agents@6.8.0'))
+    && !flyBlock.some(line => /rea-agents@(?!6\.8\.0)/u.test(line))
+    && flyBlock.some(line => /^\s+failOnStartupError: false$/u.test(line)),
+  flyBlock === null ? '安全模式块不在' : reaLines(flyBlock).join(' | '))
 check('① 不含三个模型路由键（用户机器状态）', !/^\s*(brain|hand|review)Route\s*:/mu.test(patch))
 check('② 不含 registry 的 default 覆盖（默认归上游 standard）', !/^\s+default:/mu.test(patch))
 check('不带浏览器半边（dsh.client）', manifest.dsh?.client === undefined)
@@ -119,7 +132,7 @@ check('preset-fly-standard 的 config.id 是 fly-standard', /^\s*id: fly-standar
   const totalRows = patch.split('\n').filter(line => /^\s+- id: /u.test(line)).length
   check('标准模式恰好一行 smart', smartRows.length === 1)
   check('标准模式**不含**任何安全工具行', securityRows.length === 0, securityRows.slice(0, 2).join(' | '))
-  check('整份 patch 的行数 == 两个 preset 之和（47 + 34）', totalRows === 81, String(totalRows))
+  check('整份 patch 的行数 == 两个 preset 之和（48 + 34）', totalRows === 82, String(totalRows))
 }
 check('files 里有声明文件与 tools/', (manifest.files ?? []).some(name => name.endsWith('cordis.patch.yml')) && (manifest.files ?? []).includes('tools'))
 // 内网 provider / 内网模型 id 不许进包（同 dsh-fly 主仓 shipping-hygiene 的两条红线）

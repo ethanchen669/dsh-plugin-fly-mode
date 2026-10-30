@@ -372,6 +372,38 @@
           - id: tool-fly-engagement
             name: '@dsh-fly/dsh-plugin-fly-engagement/tools/index.js'
 
+          # ── rea 逆向取证（MCP）────────────────────────────────────────────────────────
+          # 上游 REA（github.com/morluto/rea）的 MCP 桥：一行 `@deepseek-ai/dsh-mcp-client`（引擎
+          # 自带的 MCP client 插件），把 REA 的逆向取证工具面挂成 `mcp__rea__*`。版本**钉死
+          # 6.8.0**（走 npx，不预装）：REA 八天发八个大版本、每版都有 breaking changes —— 跟
+          # `latest` 会被反复打破（跟版实验记录见 dsh-fly 的 PR #1 评审）。
+          #
+          # 三条 YAML 细则（来自第三方适配器 czcdr/dsh-plugin-rea 的踩坑实录，本行全字面量、
+          # 一条 `!!js` 都不用 ⇒ 三条都天然不踩；守卫留在生成器里防将来）：
+          #   ① `!!js` 标量必须加引号 —— 裸标量含 `? ` / `: ` 会被 YAML 读成 mapping；
+          #   ② 路径只用正斜杠 —— 单引号里 `\p` `\r` `\b` 是控制字符；
+          #   ③ 要拼 home 就必须带回退链（`DSH_HOME` → `USERPROFILE`/`HOMEDRIVE+HOMEPATH` → `HOME`）。
+          #
+          # 前置与边界（README 有完整版）：需要 PATH 里有 npx（终端起的 dsh 一定有；桌面壳 GUI
+          # 启动的进程 PATH 可能没有 ⇒ 行起不来，failOnStartupError: false 只是不拖垮会话，工具
+          # 就是缺席）。与上游 `rea setup --client dsh` 写的那行**二选一**（同一个 serverName: rea，
+          # 引擎拒后到者）。Windows 未测（npx.cmd 不能被无 shell 的 spawn 直接执行）。
+          #
+          # toolCallTimeoutMs 钉 5 分钟：REA 冷启动实测 36s（小 PE）～64s（6MB DLL），默认 60s
+          # 会在第一次 open_binary 上超时。
+          - id: mcp-rea
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: rea
+              transport: stdio
+              command: npx
+              args:
+                - '--yes'
+                - 'rea-agents@6.8.0'
+                - 'mcp'
+              failOnStartupError: false
+              toolCallTimeoutMs: 300000
+
           # ── fly smart mode ───────────────────────────────────────────────────────────
 
           # Smart 模式（docs/smart-mode-design.md）：先设计、后执行、再验收的双模型工作流。
