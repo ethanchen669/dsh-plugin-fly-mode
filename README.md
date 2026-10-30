@@ -157,8 +157,9 @@ sudo apt install -y iw netcat-openbsd openssl binutils python3-venv   # Wi-Fi / 
 
 **失败形态**：`failOnStartupError: false` —— REA 起不来（没网络 / 没 npx / 版本不对）**不拖垮
 Fly 会话**，症状只是 `mcp__rea__*` 工具缺席。**不要把"工具没了"读成"REA 没这个能力"**。
-`toolCallTimeoutMs: 300000`（5 分钟）：REA 冷启动实测 36s（小 PE）～64s（6MB DLL）—— 默认 60s
-会在第一次 `open_binary` 上超时。
+`toolCallTimeoutMs: 300000`（5 分钟）：本机实测（npx 已缓存）连接 + 229 个工具同步在 10s 内
+完成；**首次**要下载 `rea-agents`，耗时随网络变。5 分钟是留白 —— 别让"首次拉包 / 开一个大
+二进制"被默认的 60s 掐掉。
 
 **与上游自己的注册二选一**：`rea setup --client dsh` 会往 profile 写一行 `serverName: rea`
 —— 同一个 serverName 只许一行（引擎拒后到者）。用了本包的行就别跑 `rea setup`，反之亦然。

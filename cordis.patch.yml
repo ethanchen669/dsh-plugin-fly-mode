@@ -389,8 +389,9 @@
           # 就是缺席）。与上游 `rea setup --client dsh` 写的那行**二选一**（同一个 serverName: rea，
           # 引擎拒后到者）。Windows 未测（npx.cmd 不能被无 shell 的 spawn 直接执行）。
           #
-          # toolCallTimeoutMs 钉 5 分钟：REA 冷启动实测 36s（小 PE）～64s（6MB DLL），默认 60s
-          # 会在第一次 open_binary 上超时。
+          # toolCallTimeoutMs 钉 5 分钟：本机实测（npx 已缓存）连接 + 229 个工具同步在 10s 内完成；
+          # **首次**要下载 rea-agents，耗时随网络变。5 分钟是留白（默认 60s 会在首次拉包 / 开一个大
+          # 二进制时被掐掉）。
           - id: mcp-rea
             name: '@deepseek-ai/dsh-mcp-client'
             config:
