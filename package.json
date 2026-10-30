@@ -1,6 +1,6 @@
 {
   "name": "@dsh-fly/dsh-plugin-fly-mode",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "Fly 模式作为一个可安装的包：**两个 preset** —— Fly 安全模式（preset-fly，8 个安全工具内联 + smart）与 Fly 标准模式（preset-fly-standard，上游 standard 的行表 + smart，无安全工具）；依赖单独发布的 `@dsh-fly/dsh-plugin-fly-smart`。",
   "type": "module",
   "license": "MIT",
